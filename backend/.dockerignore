@@ -1,0 +1,36 @@
+# ==============================================================================
+# Docker Ignore for Telegram Storage Backend
+# ==============================================================================
+
+# Secrets and Local Environment
+.env*
+!.env.example
+*.session
+*.session-journal
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Caches and Temp Storage
+temp_chunks/
+backups/
+ssd_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Git & IDEs
+.git/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+
+# Testing & Logs
+*.log
+.pytest_cache/
+.coverage
+htmlcov/

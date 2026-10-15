@@ -1,0 +1,65 @@
+# ==============================================================================
+# Telegram Cloud Storage — Community Self-Hosted Docker Compose
+# One-click deployment: Frontend (Vue 3 + Nginx) + Backend (Django + Telethon) + PostgreSQL 16
+# ==============================================================================
+
+services:
+  # ── 1. PostgreSQL Database ──
+  postgres:
+    image: postgres:16-alpine
+    container_name: telegram-drive-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-telegram_drive}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-telegram_drive}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - drive-network
+
+  # ── 2. Django Backend API & Telegram MTProto Engine ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: telegram-drive-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+    networks:
+      - drive-network
+
+  # ── 3. Frontend Web Interface & Reverse Proxy (Nginx) ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: telegram-drive-frontend
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:80"
+    depends_on:
+      - backend
+    networks:
+      - drive-network
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  drive-network:
+    driver: bridge
