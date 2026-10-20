@@ -74,8 +74,6 @@ services:
         VITE_CHUNK_SIZE_MB: ${VITE_CHUNK_SIZE_MB:-8}
     container_name: telegram-drive-frontend
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PORT:-8080}:80"
     depends_on:
       - backend
     networks:
