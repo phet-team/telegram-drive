@@ -1,7 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model, authenticate
 from django.contrib.auth.password_validation import validate_password
-from django.shortcuts import get_object_or_404
 
 from authentication.models import ApiToken
 from drive.models import Folder
@@ -120,7 +119,9 @@ class ApiTokenCreateSerializer(serializers.Serializer):
         request = self.context['request']
         folder_id = attrs.get('folder_id')
         if folder_id:
-            folder = get_object_or_404(Folder, pk=folder_id)
+            folder = Folder.objects.filter(pk=folder_id).first()
+            if not folder:
+                raise serializers.ValidationError({"folder_id": "Folder not found."})
             if not can_write(request.user, folder):
                 raise serializers.ValidationError({"folder_id": "You do not have permission to use this folder."})
             attrs['folder'] = folder

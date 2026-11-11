@@ -618,7 +618,7 @@ class FileStreamView(views.APIView):
     HTTP 206 Partial Content Range Streaming Proxy.
     Adheres strictly to RFC 9110 for seeking in video/audio and large files.
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.AllowAny, ApiTokenScopePermission]
 
     def get(self, request, pk):
         file_item = get_object_or_404(FileItem, pk=pk)
@@ -977,7 +977,7 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
 class PublicShareView(views.APIView):
     """Public endpoint to view/access shared files or folders without login"""
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.AllowAny, ApiTokenScopePermission]
 
     def get(self, request, token):
         share_link = get_object_or_404(ShareLink, token=token, is_active=True)
