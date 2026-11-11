@@ -122,7 +122,15 @@
           </div>
 
           <!-- Actions -->
-          <div class="pt-3">
+          <div class="pt-3 flex flex-col gap-1">
+            <button
+              type="button"
+              class="w-full py-2.5 px-4 text-[#1f1f1f] hover:bg-[#f0f4f9] rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
+              @click="handleApiTokens"
+            >
+              <KeyRound class="w-4 h-4" />
+              <span>API tokens</span>
+            </button>
             <button
               type="button"
               class="w-full py-2.5 px-4 text-[#d93025] hover:bg-red-50/80 rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
@@ -140,14 +148,16 @@
 
 <script setup>
 import { ref, computed } from 'vue';
-import { Search, X, HelpCircle, LogOut, Menu } from 'lucide-vue-next';
+import { Search, X, HelpCircle, LogOut, Menu, KeyRound } from 'lucide-vue-next';
 import GoogleDriveLogo from '../common/GoogleDriveLogo.vue';
 import { useAuthStore } from '../../stores/auth';
 import { useDriveStore } from '../../stores/drive';
 import { useFeedbackStore } from '../../stores/feedback';
+import { useRouter } from 'vue-router';
 
 const emit = defineEmits(['toggleSidebar']);
 
+const router = useRouter();
 const auth = useAuthStore();
 const drive = useDriveStore();
 const feedback = useFeedbackStore();
@@ -180,6 +190,11 @@ const formatBytes = (bytes) => {
 
 const showHelpToast = () => {
   feedback.showToast('info', 'Telegram Storage Engine is connected via MTProto with 2GB single-file support.');
+};
+
+const handleApiTokens = () => {
+  isDropdownOpen.value = false;
+  router.push('/settings/tokens');
 };
 
 const handleLogout = () => {

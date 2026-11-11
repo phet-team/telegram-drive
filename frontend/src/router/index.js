@@ -4,12 +4,19 @@ import DriveView from '../views/DriveView.vue';
 import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
 import SharedLinkView from '../views/SharedLinkView.vue';
+import ApiTokensView from '../views/ApiTokensView.vue';
 
 const routes = [
   {
     path: '/',
     name: 'Drive',
     component: DriveView,
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/settings/tokens',
+    name: 'ApiTokens',
+    component: ApiTokensView,
     meta: { requiresAuth: true },
   },
   {
