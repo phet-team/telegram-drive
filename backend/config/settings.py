@@ -123,10 +123,12 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # REST Framework
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
+        'authentication.token_auth.ApiTokenAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
+        'authentication.token_permissions.ApiTokenScopePermission',
     ),
     'DEFAULT_THROTTLE_CLASSES': [
         'authentication.throttles.CloudflareAnonRateThrottle',
