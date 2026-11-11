@@ -189,3 +189,71 @@ class ShareLink(models.Model):
                 name='sharelink_target_exact_one'
             )
         ]
+
+
+class StorageSettings(models.Model):
+    """
+    Singleton (pk=1) holding Telegram storage credentials, alert settings and the
+    state of an in-progress "Reconnect Telegram" login. Secrets are Fernet-encrypted.
+
+    `updated_at` is bumped only by saves that include it (credentials / settings edits);
+    runtime state writes (alert state, last check, pending login) use update_fields
+    without it so every worker's engine is not forced to reconnect.
+    """
+    AUTH_SESSION = 'session'
+    AUTH_MOCK = 'mock'
+    AUTH_MODES = [(AUTH_SESSION, 'Telegram user session'), (AUTH_MOCK, 'Mock (tests/dev)')]
+
+    FORMAT_CHOICES = [('ntfy', 'ntfy'), ('discord', 'Discord'), ('slack', 'Slack'), ('generic', 'Generic JSON')]
+    ALERT_OK = 'ok'
+    ALERT_DOWN = 'down'
+
+    auth_mode = models.CharField(max_length=16, choices=AUTH_MODES, default=AUTH_SESSION)
+    session_string_enc = models.TextField(blank=True, default='')
+    chat_id = models.CharField(max_length=128, blank=True, default='')
+
+    alert_format = models.CharField(max_length=16, choices=FORMAT_CHOICES, default='ntfy')
+    alert_webhook_url = models.URLField(max_length=1024, blank=True, default='')
+    alert_telegram_chat_id = models.CharField(max_length=32, blank=True, default='')
+    alert_min_interval_minutes = models.PositiveIntegerField(default=30)
+
+    alert_state = models.CharField(max_length=8, default=ALERT_OK)
+    last_alert_at = models.DateTimeField(null=True, blank=True)
+    last_check_at = models.DateTimeField(null=True, blank=True)
+    last_check_ok = models.BooleanField(null=True, blank=True)
+    last_check_reason = models.CharField(max_length=64, blank=True, default='')
+
+    pending_login_session_enc = models.TextField(blank=True, default='')
+    pending_phone = models.CharField(max_length=32, blank=True, default='')
+    pending_code_hash = models.TextField(blank=True, default='')
+    pending_expires_at = models.DateTimeField(null=True, blank=True)
+
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = 'storage settings'
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    @property
+    def has_session(self) -> bool:
+        return bool(self.session_string_enc)
+
+    def login_seconds_left(self) -> int:
+        if not self.pending_login_session_enc or not self.pending_expires_at:
+            return 0
+        return max(0, int((self.pending_expires_at - timezone.now()).total_seconds()))
+
+    def clear_pending_login(self):
+        self.pending_login_session_enc = ''
+        self.pending_phone = ''
+        self.pending_code_hash = ''
+        self.pending_expires_at = None
+
+    PENDING_FIELDS = ['pending_login_session_enc', 'pending_phone', 'pending_code_hash', 'pending_expires_at']
