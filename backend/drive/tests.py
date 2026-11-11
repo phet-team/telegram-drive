@@ -2,11 +2,14 @@ import io
 import math
 from django.test import TestCase
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework import status
 from config.env_schema import AppConfig
 from drive.models import Folder, FileItem, UploadSession, UploadChunk, Permission, ShareLink
 from drive.permissions import validate_folder_move, resolve_effective_role, can_delete_forever
+from authentication.models import ApiToken
 from storage_engine.signed_token import generate_media_token, verify_media_token
 
 User = get_user_model()
@@ -376,3 +379,149 @@ class UploadAndStreamingTests(TestCase):
         self.assertEqual(get_res.data['status'], 'UPLOADING')
 
 
+
+
+class ApiTokenFolderRestrictionTests(TestCase):
+    """
+    Plan item 5 + 6: folder-restricted tokens.
+    A token may only act inside its folder subtree, and never beyond the
+    rights of its user.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.user = User.objects.create_user(email='restricted@example.com', password='password123')
+        self.stranger = User.objects.create_user(email='stranger2@example.com', password='password123')
+
+        self.root = Folder.objects.create(name='gen-image', owner=self.user)
+        self.child = Folder.objects.create(name='child', owner=self.user, parent=self.root)
+        self.outside = Folder.objects.create(name='outside', owner=self.user)
+
+    def _client_for(self, scopes, folder=None):
+        plaintext = ApiToken.generate_plaintext()
+        token = ApiToken.objects.create(
+            user=self.user,
+            name='restricted',
+            prefix=plaintext[:12],
+            token_hash=ApiToken.hash_token(plaintext),
+            scopes=scopes,
+            folder=folder,
+        )
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {plaintext}')
+        return client, token
+
+    def test_list_without_parent_returns_only_token_folder(self):
+        client, _ = self._client_for(['read'], folder=self.root)
+        res = client.get('/api/drive/folders/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 1)
+        self.assertEqual(str(res.data[0]['id']), str(self.root.id))
+
+    def test_list_parent_outside_subtree_is_403(self):
+        client, _ = self._client_for(['read'], folder=self.child)
+        res = client.get('/api/drive/folders/?parent=' + str(self.root.id))
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_search_and_shared_filters_are_403_for_tokens(self):
+        client, _ = self._client_for(['read'], folder=self.root)
+        self.assertEqual(client.get('/api/drive/folders/?search=gen').status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(client.get('/api/drive/folders/?shared=true').status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_folder_create_requires_parent_inside_subtree(self):
+        client, _ = self._client_for(['folders:create'], folder=self.root)
+        # no parent → 403
+        res = client.post('/api/drive/folders/', {'name': 'no-parent'})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        # parent outside subtree → 403
+        res2 = client.post('/api/drive/folders/', {'name': 'outside', 'parent': str(self.outside.id)})
+        self.assertEqual(res2.status_code, status.HTTP_403_FORBIDDEN)
+        # inside subtree → 201
+        res3 = client.post('/api/drive/folders/', {'name': 'inside', 'parent': str(self.child.id)})
+        self.assertEqual(res3.status_code, status.HTTP_201_CREATED)
+        created = Folder.objects.get(name='inside')
+        self.assertEqual(created.parent_id, self.child.id)
+        self.assertEqual(created.owner_id, self.user.id)
+
+    def test_folder_detail_outside_subtree_is_403(self):
+        client, _ = self._client_for(['read'], folder=self.child)
+        res = client.get(f'/api/drive/folders/{self.outside.id}/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_file_list_requires_folder_inside_subtree(self):
+        client, _ = self._client_for(['read'], folder=self.root)
+        # no folder param → 403
+        res = client.get('/api/drive/files/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        # outside subtree → 403
+        res2 = client.get('/api/drive/files/?folder=' + str(self.outside.id))
+        self.assertEqual(res2.status_code, status.HTTP_403_FORBIDDEN)
+        # inside → 200
+        res3 = client.get('/api/drive/files/?folder=' + str(self.child.id))
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+
+    def test_upload_outside_subtree_is_403(self):
+        client, _ = self._client_for(['files:upload'], folder=self.child)
+        res = client.post('/api/drive/uploads/initiate/', {
+            'filename': 'outside.png', 'total_size': 1024, 'folder_id': str(self.outside.id),
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_initiate_requires_folder_id_for_restricted_token(self):
+        client, _ = self._client_for(['files:upload'], folder=self.child)
+        res = client.post('/api/drive/uploads/initiate/', {'filename': 'x.png', 'total_size': 1024})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_full_upload_inside_subtree_succeeds_and_lands_in_folder(self):
+        from django.db.models import Q
+
+        client, _ = self._client_for(['files:upload'], folder=self.root)
+        payload = b'pixel-data-payload' * 4
+
+        init_res = client.post('/api/drive/uploads/initiate/', {
+            'filename': 'studio.png', 'total_size': len(payload), 'folder_id': str(self.child.id),
+        })
+        self.assertEqual(init_res.status_code, status.HTTP_201_CREATED)
+        session_id = init_res.data['session_id']
+        self.assertEqual(init_res.data['total_chunks'], 1)
+
+        chunk_res = client.put(
+            f'/api/drive/uploads/{session_id}/chunks/0/', data=payload,
+            content_type='application/octet-stream',
+        )
+        self.assertEqual(chunk_res.status_code, status.HTTP_200_OK)
+
+        complete_res = client.post(f'/api/drive/uploads/{session_id}/complete/')
+        self.assertEqual(complete_res.status_code, status.HTTP_201_CREATED)
+        file_id = complete_res.data['id']
+
+        landed = FileItem.objects.get(pk=file_id)
+        self.assertEqual(landed.folder_id, self.child.id)
+        self.assertEqual(landed.owner_id, self.user.id)
+        self.assertEqual(landed.size, len(payload))
+        # the session's folder is re-checked after token change: revoke → complete/chunks blocked
+        ApiToken.objects.all().update(revoked_at=timezone.now())
+        self.assertEqual(
+            client.post(f'/api/drive/uploads/{session_id}/complete/').status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    def test_token_never_exceeds_users_rights(self):
+        # user has editor permission on a stranger's folder → token allowed
+        foreign = Folder.objects.create(name='foreign', owner=self.stranger)
+        from drive.models import Permission
+        Permission.objects.create(user=self.user, folder=foreign, role='editor')
+
+        client, _ = self._client_for(['files:upload'], folder=foreign)
+        init_res = client.post('/api/drive/uploads/initiate/', {
+            'filename': 'ok.png', 'total_size': 64, 'folder_id': str(foreign.id),
+        })
+        self.assertEqual(init_res.status_code, status.HTTP_201_CREATED)
+
+        # user loses write access → the token must lose it too
+        Permission.objects.filter(user=self.user, folder=foreign).delete()
+        res = client.post('/api/drive/uploads/initiate/', {
+            'filename': 'denied.png', 'total_size': 64, 'folder_id': str(foreign.id),
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
