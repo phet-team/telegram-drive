@@ -1,3 +1,7 @@
+import hashlib
+import secrets
+import uuid
+
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.utils import timezone
@@ -53,3 +57,50 @@ class User(AbstractBaseUser, PermissionsMixin):
         if self.storage_quota is None:
             return 10**18  # Unlimited Telegram Storage (~1 Exabyte)
         return max(0, self.storage_quota - (self.storage_used + self.storage_reserved))
+
+
+class ApiToken(models.Model):
+    """Revocable, scoped, optionally folder-restricted personal API token."""
+    SCOPE_READ = 'read'
+    SCOPE_FOLDERS_CREATE = 'folders:create'
+    SCOPE_FILES_UPLOAD = 'files:upload'
+    ALLOWED_SCOPES = {SCOPE_READ, SCOPE_FOLDERS_CREATE, SCOPE_FILES_UPLOAD}
+    MAX_ACTIVE_TOKENS = 20
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='api_tokens')
+    name = models.CharField(max_length=100)
+    prefix = models.CharField(max_length=12, help_text="First 12 chars of the token, for display only")
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    scopes = models.JSONField(default=list)
+    folder = models.ForeignKey('drive.Folder', null=True, blank=True, on_delete=models.CASCADE)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    last_used_ip = models.GenericIPAddressField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} ({self.prefix})"
+
+    @staticmethod
+    def generate_plaintext() -> str:
+        return "tdk_" + secrets.token_urlsafe(30)
+
+    @staticmethod
+    def hash_token(plaintext: str) -> str:
+        return hashlib.sha256(plaintext.encode('utf-8')).hexdigest()
+
+    @property
+    def is_revoked(self) -> bool:
+        return self.revoked_at is not None
+
+    def set_plaintext(self, plaintext: str):
+        """Holds the one-time plaintext in memory (never persisted)."""
+        self._plaintext = plaintext
+
+    @property
+    def plaintext(self) -> str:
+        return getattr(self, '_plaintext', '')
