@@ -34,7 +34,9 @@ from drive.permissions import (
 from authentication.token_permissions import (
     get_api_token, enforce_token_subtree, is_in_subtree, ApiTokenScopePermission,
 )
+from storage_engine import health
 from storage_engine.client import get_storage_engine
+from storage_engine.errors import ContentUnavailable, StorageUnavailable
 from storage_engine.signed_token import generate_media_token, verify_media_token, parse_and_verify_media_token
 from config.env_schema import config
 
@@ -337,6 +339,7 @@ class FileItemViewSet(viewsets.ModelViewSet):
         file_item = self.get_object()
         if not can_delete_forever(request.user, file_item):
             raise PermissionDenied("Only the file owner can delete permanently.")
+        health.raise_if_known_down()
 
         # In-System hard delete & Best-effort Telegram deleteMessage
         engine = get_storage_engine()
@@ -351,8 +354,14 @@ class FileItemViewSet(viewsets.ModelViewSet):
             owner.save(update_fields=['storage_used'])
 
         # Best effort Telegram message cleanup
-        for chunk in chunks:
-            engine.delete_chunk(chunk.telegram_message_id)
+        try:
+            for chunk in chunks:
+                engine.delete_chunk(chunk.telegram_message_id)
+        except StorageUnavailable as exc:
+            logger.warning(
+                "File %s deleted locally but its storage messages could not be removed (reason=%s)",
+                file_item.id, exc.reason,
+            )
 
         return Response({'message': 'File permanently deleted'})
 
@@ -407,6 +416,9 @@ class UploadViewSet(viewsets.ViewSet):
 
         expected_sha256 = request.data.get('expected_sha256', '')
         mime_type = request.data.get('mime_type', 'application/octet-stream')
+
+        # Refuse early (503) when storage is known to be down: no quota reserved, no session created
+        health.raise_if_known_down()
 
         # 1. Atomic quota check & reservation (if quota is configured)
         with transaction.atomic():
@@ -694,6 +706,8 @@ class FileStreamView(views.APIView):
             chunk = chunks_qs[0]
             try:
                 chunk_data = engine.download_chunk(chunk.telegram_file_id, chunk.telegram_message_id)
+            except (StorageUnavailable, ContentUnavailable):
+                raise  # 503 / 410 via the DRF exception handler
             except Exception as e:
                 logger.error(f"Failed downloading chunk for file {file_item.id}: {e}")
                 return HttpResponse(b"Failed to retrieve file content from storage.", status=502, content_type="text/plain")
@@ -777,6 +791,19 @@ class FileStreamView(views.APIView):
                 end = total_size - 1
                 content_length = total_size
                 status_code = 200
+
+            # Fetch the first needed chunk now (it stays in the engine's LRU cache) so a storage
+            # problem becomes a proper 503/410 instead of a truncated 200/206 body.
+            for c_start, c_end, chunk in chunk_spans:
+                if c_end > start and c_start <= end:
+                    try:
+                        engine.download_chunk(chunk.telegram_file_id, chunk.telegram_message_id)
+                    except (StorageUnavailable, ContentUnavailable):
+                        raise
+                    except Exception as e:
+                        logger.error(f"Failed downloading chunk {chunk.chunk_index} for file {file_item.id}: {e}")
+                        return HttpResponse(b"Failed to retrieve file content from storage.", status=502, content_type="text/plain")
+                    break
 
             def stream_generator():
                 for c_start, c_end, chunk in chunk_spans:

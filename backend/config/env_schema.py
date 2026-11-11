@@ -39,6 +39,8 @@ class AppConfig(BaseSettings):
     TELEGRAM_SESSION_STRING: str = ""
     TELEGRAM_STORAGE_CHAT_ID: str = ""
     TELEGRAM_BOT_TOKEN: str = ""
+    # Public origin of the web UI (e.g. https://drive.example.com), used in storage alert links
+    PUBLIC_URL: str = ""
 
     # Google OAuth
     GOOGLE_CLIENT_ID: str = ""

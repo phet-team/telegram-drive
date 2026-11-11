@@ -38,6 +38,7 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'storage_engine.middleware.RememberPublicHostMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -139,7 +140,9 @@ REST_FRAMEWORK = {
         'user': '1000/min',
         'auth': '10/min',
         'login': '5/min',
-    }
+        'storage_login': '5/hour',
+    },
+    'EXCEPTION_HANDLER': 'storage_engine.exception_handler.storage_exception_handler',
 }
 
 # SimpleJWT configuration

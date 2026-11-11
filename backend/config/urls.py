@@ -5,4 +5,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/auth/', include('authentication.urls')),
     path('api/drive/', include('drive.urls')),
+    path('api/', include('storage_engine.urls')),
 ]
