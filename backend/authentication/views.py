@@ -13,9 +13,18 @@ from django.core.cache import cache
 from config.env_schema import config
 from authentication.serializers import (
     RegisterSerializer, LoginSerializer, UserSerializer,
-    TelegramAuthSerializer, GoogleAuthSerializer
+    TelegramAuthSerializer, GoogleAuthSerializer, ApiTokenSerializer, ApiTokenCreateSerializer
 )
 from authentication.throttles import StrictLoginRateThrottle
+from authentication.models import ApiToken
+from authentication.token_permissions import ApiTokenScopePermission
+from drive.permissions import can_write
+from drive.models import Folder
+from rest_framework import status, views, permissions
+from rest_framework.response import Response
+from django.shortcuts import get_object_or_404
+from rest_framework.exceptions import PermissionDenied
+from django.utils import timezone
 
 User = get_user_model()
 
@@ -142,7 +151,7 @@ class CookieTokenRefreshView(views.APIView):
 
 
 class MeView(views.APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
 
     def get(self, request):
         return Response(UserSerializer(request.user).data)
@@ -320,3 +329,32 @@ class GoogleAuthView(views.APIView):
         except Exception as e:
             logger.warning(f"Google token verification failed: {e}")
             return Response({'error': 'Google token verification failed'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ApiTokenListCreateView(views.APIView):
+    """JWT-only management of the caller's API tokens. API-token auth → 403."""
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
+
+    def get(self, request):
+        tokens = ApiToken.objects.filter(user=request.user).select_related('folder')
+        return Response(ApiTokenSerializer(tokens, many=True).data)
+
+    def post(self, request):
+        serializer = ApiTokenCreateSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        token = serializer.save()
+        data = ApiTokenSerializer(token).data
+        data['token'] = token.plaintext
+        return Response(data, status=status.HTTP_201_CREATED)
+
+
+class ApiTokenRevokeView(views.APIView):
+    """JWT-only. Revokes (soft-deletes) an API token owned by the caller."""
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
+
+    def delete(self, request, pk):
+        token = get_object_or_404(ApiToken, pk=pk, user=request.user)
+        if token.revoked_at is None:
+            token.revoked_at = timezone.now()
+            token.save(update_fields=['revoked_at'])
+        return Response(status=status.HTTP_204_NO_CONTENT)

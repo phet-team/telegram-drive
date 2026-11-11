@@ -1,6 +1,11 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model, authenticate
 from django.contrib.auth.password_validation import validate_password
+from django.shortcuts import get_object_or_404
+
+from authentication.models import ApiToken
+from drive.models import Folder
+from drive.permissions import can_write
 
 User = get_user_model()
 
@@ -77,3 +82,68 @@ class TelegramAuthSerializer(serializers.Serializer):
 
 class GoogleAuthSerializer(serializers.Serializer):
     id_token = serializers.CharField()
+
+
+class ApiTokenSerializer(serializers.ModelSerializer):
+    folder = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ApiToken
+        fields = [
+            'id', 'name', 'prefix', 'scopes', 'folder',
+            'created_at', 'last_used_at', 'last_used_ip', 'revoked_at',
+        ]
+        read_only_fields = fields
+
+    def get_folder(self, obj):
+        if obj.folder is None:
+            return None
+        return {'id': str(obj.folder.id), 'name': obj.folder.name}
+
+
+class ApiTokenCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=100)
+    scopes = serializers.ListField(child=serializers.CharField(max_length=64), allow_empty=False)
+    folder_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_scopes(self, value):
+        if not value:
+            raise serializers.ValidationError("At least one scope is required.")
+        invalid = [s for s in value if s not in ApiToken.ALLOWED_SCOPES]
+        if invalid:
+            raise serializers.ValidationError(f"Invalid scopes: {', '.join(invalid)}")
+        # de-duplicate while preserving order
+        seen = set()
+        return [s for s in value if not (s in seen or seen.add(s))]
+
+    def validate(self, attrs):
+        request = self.context['request']
+        folder_id = attrs.get('folder_id')
+        if folder_id:
+            folder = get_object_or_404(Folder, pk=folder_id)
+            if not can_write(request.user, folder):
+                raise serializers.ValidationError({"folder_id": "You do not have permission to use this folder."})
+            attrs['folder'] = folder
+        else:
+            attrs['folder'] = None
+
+        active = ApiToken.objects.filter(user=request.user, revoked_at__isnull=True).count()
+        if active >= ApiToken.MAX_ACTIVE_TOKENS:
+            raise serializers.ValidationError(
+                f"Maximum of {ApiToken.MAX_ACTIVE_TOKENS} active API tokens reached."
+            )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context['request']
+        plaintext = ApiToken.generate_plaintext()
+        token = ApiToken.objects.create(
+            user=request.user,
+            name=validated_data['name'].strip() or 'API token',
+            prefix=plaintext[:12],
+            token_hash=ApiToken.hash_token(plaintext),
+            scopes=validated_data['scopes'],
+            folder=validated_data.get('folder'),
+        )
+        token.set_plaintext(plaintext)
+        return token

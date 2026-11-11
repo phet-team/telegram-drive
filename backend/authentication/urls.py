@@ -1,7 +1,8 @@
 from django.urls import path
 from authentication.views import (
     RegisterView, LoginView, MeView, LogoutView,
-    TelegramAuthView, GoogleAuthView, CookieTokenRefreshView
+    TelegramAuthView, GoogleAuthView, CookieTokenRefreshView,
+    ApiTokenListCreateView, ApiTokenRevokeView
 )
 
 urlpatterns = [
@@ -12,4 +13,6 @@ urlpatterns = [
     path('logout/', LogoutView.as_view(), name='auth_logout'),
     path('telegram/', TelegramAuthView.as_view(), name='auth_telegram'),
     path('google/', GoogleAuthView.as_view(), name='auth_google'),
+    path('tokens/', ApiTokenListCreateView.as_view(), name='auth_tokens'),
+    path('tokens/<uuid:pk>/', ApiTokenRevokeView.as_view(), name='auth_token_revoke'),
 ]
