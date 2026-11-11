@@ -31,6 +31,9 @@ from drive.permissions import (
     can_share, validate_folder_move, get_accessible_folders, get_accessible_files,
     is_item_or_ancestor_trashed
 )
+from authentication.token_permissions import (
+    get_api_token, enforce_token_subtree, is_in_subtree, ApiTokenScopePermission,
+)
 from storage_engine.client import get_storage_engine
 from storage_engine.signed_token import generate_media_token, verify_media_token, parse_and_verify_media_token
 from config.env_schema import config
@@ -40,10 +43,11 @@ logger = logging.getLogger(__name__)
 
 class FolderViewSet(viewsets.ModelViewSet):
     serializer_class = FolderSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
 
     def get_queryset(self):
         user = self.request.user
+        token = get_api_token(self.request)
         if self.action == 'destroy':
             if user.is_superuser:
                 return Folder.objects.all()
@@ -53,6 +57,18 @@ class FolderViewSet(viewsets.ModelViewSet):
         search = self.request.query_params.get('search', '').strip()
         # Crucial: Only filter parent for 'list' action; allow detail actions on any subfolder!
         if self.action == 'list':
+            if token is not None and token.folder_id is not None:
+                # Folder-restricted tokens: search/shared/trashed not allowed
+                if search or is_shared or is_trashed:
+                    raise PermissionDenied("API token cannot use search, shared or trashed filters.")
+                parent_id = self.request.query_params.get('parent')
+                root = token.folder
+                if parent_id is None:
+                    # Listing without parent returns only the token folder itself
+                    return Folder.objects.filter(pk=root.pk)
+                parent = get_object_or_404(Folder, pk=parent_id)
+                if parent.id != root.id and not is_in_subtree(parent, root):
+                    raise PermissionDenied("API token cannot list folders outside its folder.")
             if search:
                 qs = get_accessible_folders(user, parent_id='ALL', is_trashed=is_trashed, is_shared=is_shared)
                 if not is_shared:
@@ -63,6 +79,22 @@ class FolderViewSet(viewsets.ModelViewSet):
             parent_id = self.request.query_params.get('parent')
             return get_accessible_folders(user, parent_id=parent_id, is_trashed=is_trashed, is_shared=is_shared)
         return get_accessible_folders(user, parent_id='ALL', is_trashed=is_trashed, is_shared=is_shared)
+
+    def create(self, request, *args, **kwargs):
+        token = get_api_token(request)
+        if token is not None and token.folder_id is not None:
+            parent_id = request.data.get('parent')
+            if not parent_id:
+                raise PermissionDenied("API token requires a parent folder inside its folder.")
+            parent = get_object_or_404(Folder, pk=parent_id)
+            if parent.id != token.folder_id and not is_in_subtree(parent, token.folder):
+                raise PermissionDenied("API token cannot create folders outside its folder.")
+        return super().create(request, *args, **kwargs)
+
+    def retrieve(self, request, *args, **kwargs):
+        folder = self.get_object()
+        enforce_token_subtree(request, folder)
+        return super().retrieve(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         user = self.request.user
@@ -175,10 +207,11 @@ class FolderViewSet(viewsets.ModelViewSet):
 
 class FileItemViewSet(viewsets.ModelViewSet):
     serializer_class = FileItemSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
 
     def get_queryset(self):
         user = self.request.user
+        token = get_api_token(self.request)
         if self.action == 'destroy':
             if user.is_superuser:
                 return FileItem.objects.all()
@@ -188,6 +221,16 @@ class FileItemViewSet(viewsets.ModelViewSet):
         search = self.request.query_params.get('search', '').strip()
         # Crucial: Only filter folder for 'list' action; allow detail actions on any subfolder file!
         if self.action == 'list':
+            if token is not None and token.folder_id is not None:
+                # Folder-restricted tokens: search/shared/trashed not allowed
+                if search or is_shared or is_trashed:
+                    raise PermissionDenied("API token cannot use search, shared or trashed filters.")
+                folder_id = self.request.query_params.get('folder')
+                if not folder_id:
+                    raise PermissionDenied("API token requires the folder parameter inside its folder.")
+                folder = get_object_or_404(Folder, pk=folder_id)
+                if folder.id != token.folder_id and not is_in_subtree(folder, token.folder):
+                    raise PermissionDenied("API token cannot list files outside its folder.")
             if search:
                 qs = get_accessible_files(user, folder_id='ALL', is_trashed=is_trashed, is_shared=is_shared)
                 if not is_shared:
@@ -198,6 +241,11 @@ class FileItemViewSet(viewsets.ModelViewSet):
             folder_id = self.request.query_params.get('folder')
             return get_accessible_files(user, folder_id=folder_id, is_trashed=is_trashed, is_shared=is_shared)
         return get_accessible_files(user, folder_id='ALL', is_trashed=is_trashed, is_shared=is_shared)
+
+    def retrieve(self, request, *args, **kwargs):
+        file_item = self.get_object()
+        enforce_token_subtree(request, file_item)
+        return super().retrieve(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'])
     def rename(self, request, pk=None):
@@ -310,11 +358,12 @@ class FileItemViewSet(viewsets.ModelViewSet):
 
 
 class UploadViewSet(viewsets.ViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
 
     def retrieve(self, request, pk=None):
         """Retrieves upload session status and list of successfully uploaded chunk indices for resumable uploads"""
         session = get_object_or_404(UploadSession, pk=pk, user=request.user)
+        enforce_token_subtree(request, session.folder)
         uploaded_chunks = list(
             session.uploaded_chunks.filter(status='UPLOADED').values_list('chunk_index', flat=True)
         )
@@ -332,6 +381,7 @@ class UploadViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'])
     def initiate(self, request):
         user = request.user
+        token = get_api_token(request)
         raw_name = request.data.get('filename', '').strip()
         filename = get_valid_filename(raw_name)
         try:
@@ -351,6 +401,9 @@ class UploadViewSet(viewsets.ViewSet):
             folder = get_object_or_404(Folder, pk=folder_id)
             if not can_write(user, folder):
                 raise PermissionDenied("Cannot upload to this folder.")
+        elif token is not None and token.folder_id is not None:
+            raise PermissionDenied("API token requires folder_id inside its folder.")
+        enforce_token_subtree(request, folder)
 
         expected_sha256 = request.data.get('expected_sha256', '')
         mime_type = request.data.get('mime_type', 'application/octet-stream')
@@ -410,6 +463,7 @@ class UploadViewSet(viewsets.ViewSet):
     @action(detail=True, methods=['put'], url_path='chunks/(?P<chunk_index>[0-9]+)')
     def upload_chunk(self, request, pk=None, chunk_index=None):
         session = get_object_or_404(UploadSession, pk=pk, user=request.user)
+        enforce_token_subtree(request, session.folder)
         if session.status != 'UPLOADING' or session.is_expired():
             raise ValidationError("Upload session is expired or not active.")
 
@@ -452,6 +506,7 @@ class UploadViewSet(viewsets.ViewSet):
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):
         session = get_object_or_404(UploadSession, pk=pk, user=request.user)
+        enforce_token_subtree(request, session.folder)
         if session.folder:
             if not can_write(request.user, session.folder):
                 raise PermissionDenied("You do not have permission to write to destination folder.")
@@ -771,7 +826,7 @@ class FileStreamView(views.APIView):
 
 
 class ShareViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
     serializer_class = ShareLinkSerializer
 
     def get_queryset(self):
@@ -853,7 +908,7 @@ class ShareViewSet(viewsets.ModelViewSet):
 
 
 class PermissionViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission]
     serializer_class = PermissionSerializer
 
     def get_queryset(self):
