@@ -132,6 +132,15 @@
               <span>API tokens</span>
             </button>
             <button
+              v-if="auth.user?.is_superuser"
+              type="button"
+              class="w-full py-2.5 px-4 text-[#1f1f1f] hover:bg-[#f0f4f9] rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
+              @click="handleStorageSettings"
+            >
+              <HardDrive class="w-4 h-4" />
+              <span>Storage</span>
+            </button>
+            <button
               type="button"
               class="w-full py-2.5 px-4 text-[#d93025] hover:bg-red-50/80 rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
               @click="handleLogout"
@@ -148,7 +157,7 @@
 
 <script setup>
 import { ref, computed } from 'vue';
-import { Search, X, HelpCircle, LogOut, Menu, KeyRound } from 'lucide-vue-next';
+import { Search, X, HelpCircle, LogOut, Menu, KeyRound, HardDrive } from 'lucide-vue-next';
 import GoogleDriveLogo from '../common/GoogleDriveLogo.vue';
 import { useAuthStore } from '../../stores/auth';
 import { useDriveStore } from '../../stores/drive';
@@ -195,6 +204,11 @@ const showHelpToast = () => {
 const handleApiTokens = () => {
   isDropdownOpen.value = false;
   router.push('/settings/tokens');
+};
+
+const handleStorageSettings = () => {
+  isDropdownOpen.value = false;
+  router.push('/settings/storage');
 };
 
 const handleLogout = () => {

@@ -5,6 +5,7 @@ import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
 import SharedLinkView from '../views/SharedLinkView.vue';
 import ApiTokensView from '../views/ApiTokensView.vue';
+import StorageSettingsView from '../views/StorageSettingsView.vue';
 
 const routes = [
   {
@@ -18,6 +19,12 @@ const routes = [
     name: 'ApiTokens',
     component: ApiTokensView,
     meta: { requiresAuth: true },
+  },
+  {
+    path: '/settings/storage',
+    name: 'StorageSettings',
+    component: StorageSettingsView,
+    meta: { requiresAuth: true, requiresSuperuser: true },
   },
   {
     path: '/login',
@@ -56,6 +63,8 @@ router.beforeEach(async (to, from, next) => {
       path: '/login',
       query: to.fullPath && to.fullPath !== '/' ? { redirect: to.fullPath } : {},
     });
+  } else if (to.meta.requiresSuperuser && !authStore.user?.is_superuser) {
+    next('/');
   } else if ((to.name === 'Login' || to.name === 'Register') && authStore.isAuthenticated) {
     const redirectStr = String(to.query.redirect || '');
     const redirect = redirectStr.startsWith('/') && !redirectStr.startsWith('//')

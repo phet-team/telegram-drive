@@ -1,5 +1,7 @@
 <template>
   <div class="h-screen h-[100dvh] w-full max-w-[100vw] flex flex-col bg-drive-bg overflow-hidden text-[#1f1f1f] font-sans" @click="closeContextMenu">
+    <StorageAlertBanner />
+
     <!-- Navbar -->
     <Navbar @toggle-sidebar="isMobileSidebarOpen = !isMobileSidebarOpen" />
 
@@ -174,6 +176,7 @@ import { useDriveStore } from '../stores/drive';
 import { useFeedbackStore } from '../stores/feedback';
 import { useHistoryStore } from '../stores/history';
 import Navbar from '../components/layout/Navbar.vue';
+import StorageAlertBanner from '../components/feedback/StorageAlertBanner.vue';
 import Sidebar from '../components/layout/Sidebar.vue';
 import Breadcrumbs from '../components/layout/Breadcrumbs.vue';
 import SelectionToolbar from '../components/layout/SelectionToolbar.vue';
