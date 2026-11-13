@@ -258,6 +258,8 @@ class TelegramMTProtoEngine(BaseStorageEngine):
                 raise StorageUnavailable('credentials_unreadable')
             if self.key != 'system' and not creds.session_str:
                 raise StorageUnavailable('storage_not_connected')
+            if self.key != 'system' and not creds.chat_id:
+                raise StorageUnavailable('channel_unreachable')
             result = self._thread.run_coro(self._call(creds, label, op, which))
         except StorageUnavailable as exc:
             health.record_failure(exc.reason, key=self.key)

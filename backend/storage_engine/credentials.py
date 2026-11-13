@@ -104,7 +104,7 @@ def _build_user(row) -> CredentialSnapshot:
             session_str = decrypt(row.session_string_enc)
         except CredentialsUnreadable:
             session_str, unreadable = '', True
-    chat_id = 'me'
+    chat_id = None
     if row is not None and row.channel_id and row.channel_access_hash:
         from telethon.tl.types import InputPeerChannel
 

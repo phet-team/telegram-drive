@@ -340,6 +340,25 @@ class EngineRoutingTests(UserStorageTestCase):
         self.account.refresh_from_db()
         self.assertEqual(self.account.status, 'disconnected')
 
+    def test_user_account_without_channel_raises_channel_unreachable_on_upload(self):
+        user = User.objects.create_user(email='nochannel@example.com', system_storage_allowed=True)
+        account = self.link_account(user, session='USER-NO-CHAN', channel=(None, None))
+        client = self.api(user)
+        res = self.initiate(client, size=10)
+        self.assertEqual(res.status_code, 201)
+        session_id = res.data['session_id']
+        put = self.put_chunk(client, session_id, data=b'A' * 10)
+        self.assertEqual(put.status_code, 503)
+        self.assertEqual(put.json()['reason'], 'channel_unreachable')
+        self.assertEqual(self.telegram.send_file_calls, 0)
+        self.assertEqual(self.telegram.chats, [])
+
+        engine = engine_client.get_storage_engine(account=account)
+        with self.assertRaises(StorageUnavailable) as ctx:
+            engine.upload_chunk(b'hello', 'test.bin')
+        self.assertEqual(ctx.exception.reason, 'channel_unreachable')
+        self.assertEqual(self.telegram.send_file_calls, 0)
+
 
 # -------------------------------------------------------------------------- test 4: quota
 

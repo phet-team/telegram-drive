@@ -43,6 +43,7 @@ class FakeClient:
 
     async def send_file(self, chat, stream, caption=None, force_document=False):
         self.world.raise_scripted('send_file')
+        self.world.send_file_calls += 1
         message_id = next(self.world.ids)
         self.world.store[message_id] = stream.getvalue()
         self.world.chats.append(chat)
@@ -107,6 +108,7 @@ class FakeTelegram:
         self.code_requests = []
         self.sign_ins = []
         self.log_out_calls = 0
+        self.send_file_calls = 0
         self.clients = []
         self.me = SimpleNamespace(first_name='Alice', id=5550001)
         self.scripted = {}  # method name -> list of exceptions raised one per call, in order
