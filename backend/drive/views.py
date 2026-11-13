@@ -8,7 +8,9 @@ from django.utils import timezone
 from django.utils.text import get_valid_filename
 from django.contrib.auth.hashers import make_password, check_password
 from django.db import transaction
-from django.db.models import Q
+from django.contrib.auth import get_user_model
+from django.db.models import F, Q
+from django.db.models.functions import Greatest
 from django.http import HttpResponse, StreamingHttpResponse, Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, views, status, permissions
@@ -36,11 +38,38 @@ from authentication.token_permissions import (
 )
 from storage_engine import health
 from storage_engine.accounts import engine_for, resolve_upload_target
-from storage_engine.errors import ContentUnavailable, StorageUnavailable
+from storage_engine.errors import ContentUnavailable, StorageNotConnected, StorageUnavailable
 from storage_engine.signed_token import generate_media_token, verify_media_token, parse_and_verify_media_token
 from config.env_schema import config
 
 logger = logging.getLogger(__name__)
+
+
+def _release_used(user_pk, size):
+    """Atomic `storage_used -= size` (floored at 0); never saves a stale User instance."""
+    get_user_model().objects.filter(pk=user_pk).update(storage_used=Greatest(F('storage_used') - size, 0))
+
+
+def _locked_user(user):
+    """The requesting user's row under SELECT ... FOR UPDATE (call inside transaction.atomic)."""
+    return get_user_model().objects.select_for_update().get(pk=user.pk)
+
+
+def _refuse_if_system_grant_revoked(user, session):
+    """
+    A system-storage session opened before the admin revoked the grant must not keep writing:
+    cancel it, release its reservation, then answer 409 storage_not_connected.
+    """
+    if session.storage_account_id is not None or user.can_use_system_storage:
+        return
+    with transaction.atomic():
+        locked = UploadSession.objects.select_for_update().get(pk=session.pk)
+        if locked.status == 'UPLOADING':
+            get_user_model().objects.filter(pk=user.pk).update(
+                storage_reserved=Greatest(F('storage_reserved') - locked.total_size, 0))
+            locked.status = 'CANCELLED'
+            locked.save(update_fields=['status', 'updated_at'])
+    raise StorageNotConnected("Your access to the system storage was removed. Connect your Telegram account in Settings → My storage to upload.")
 
 
 class FolderViewSet(viewsets.ModelViewSet):
@@ -178,17 +207,14 @@ class FolderViewSet(viewsets.ModelViewSet):
         if not can_delete_forever(request.user, folder):
             raise PermissionDenied("Only the folder owner can delete permanently.")
 
-        # Collect all descendant folders (including self)
+        # Folders that will really be deleted: the folder plus descendants owned by the requester.
+        # Foreign subfolders are detached below and keep their whole subtree (and its files).
         all_folders = [folder]
         frontier = [folder]
         while frontier:
-            sub = list(Folder.objects.filter(parent__in=frontier))
+            sub = list(Folder.objects.filter(parent__in=frontier, owner=request.user))
             all_folders.extend(sub)
             frontier = sub
-
-        # Safeguard foreign items: detach them to user's root instead of cascade deleting!
-        FileItem.objects.filter(folder__in=all_folders).exclude(owner=request.user).update(folder=None)
-        Folder.objects.filter(parent__in=all_folders).exclude(owner=request.user).update(parent=None)
 
         # Cleanup Telegram chunks and quota for user's files inside, grouped by storage account.
         user_files = list(FileItem.objects.filter(folder__in=all_folders, owner=request.user))
@@ -201,6 +227,10 @@ class FolderViewSet(viewsets.ModelViewSet):
             if storage_account is not None and not storage_account.has_session:
                 continue
             health.raise_if_known_down(key='system' if storage_account is None else f"user:{storage_account.id}")
+
+        # Safeguard foreign items: detach them to user's root instead of cascade deleting!
+        FileItem.objects.filter(folder__in=all_folders).exclude(owner=request.user).update(folder=None)
+        Folder.objects.filter(parent__in=all_folders).exclude(owner=request.user).update(parent=None)
 
         for storage_account, group_files in by_account.items():
             if storage_account is not None and not storage_account.has_session:
@@ -221,8 +251,7 @@ class FolderViewSet(viewsets.ModelViewSet):
         # stay in the user's own channel, so only system-file sizes are freed here.
         total_freed = sum(f.size for f in user_files if f.storage_account is None)
         if total_freed > 0:
-            request.user.storage_used = max(0, request.user.storage_used - total_freed)
-            request.user.save(update_fields=['storage_used'])
+            _release_used(request.user.pk, total_freed)
 
         return super().destroy(request, *args, **kwargs)
 
@@ -374,14 +403,13 @@ class FileItemViewSet(viewsets.ModelViewSet):
             engine = engine_for(acc)
             chunks = list(file_item.chunks.all())
             file_size = file_item.size
-            owner = file_item.owner
+            owner_pk = file_item.owner_id
 
             with transaction.atomic():
                 file_item.delete()
                 # Restore quota only for files that counted against the owner's system storage.
                 if acc is None:
-                    owner.storage_used = max(0, owner.storage_used - file_size)
-                    owner.save(update_fields=['storage_used'])
+                    _release_used(owner_pk, file_size)
 
             # Best effort Telegram message cleanup
             try:
@@ -457,7 +485,7 @@ class UploadViewSet(viewsets.ViewSet):
         # 1. Quota is tracked only for system-storage uploads: atomic check & reservation
         with transaction.atomic():
             if target_account is None:
-                user.refresh_from_db()
+                user = _locked_user(user)
                 if user.storage_quota is not None and user.available_quota < total_size:
                     raise ValidationError("Insufficient storage quota.")
                 user.storage_reserved += total_size
@@ -527,6 +555,7 @@ class UploadViewSet(viewsets.ViewSet):
         if len(chunk_data) > session.chunk_size + 4096:
             raise ValidationError("Chunk payload exceeds session chunk size limit.")
 
+        _refuse_if_system_grant_revoked(request.user, session)
         chunk_hash = hashlib.sha256(chunk_data).hexdigest()
         engine = engine_for(session.storage_account)
 
@@ -563,6 +592,7 @@ class UploadViewSet(viewsets.ViewSet):
 
         if session.status != 'UPLOADING':
             raise ValidationError("Upload session is not in UPLOADING state.")
+        _refuse_if_system_grant_revoked(request.user, session)
 
         uploaded_chunks = list(session.uploaded_chunks.filter(status='UPLOADED').order_by('chunk_index'))
         if len(uploaded_chunks) != session.total_chunks:
@@ -576,8 +606,11 @@ class UploadViewSet(viewsets.ViewSet):
             )
 
         with transaction.atomic():
-            user = request.user
-            user.refresh_from_db()
+            user = _locked_user(request.user)
+            # Re-check under the lock: a concurrent complete/cancel may have finished this session.
+            session = UploadSession.objects.select_for_update().get(pk=session.pk)
+            if session.status != 'UPLOADING':
+                raise ValidationError("Upload session is not in UPLOADING state.")
 
             replace_file_id = request.data.get('replace_file_id')
             old_file = None
@@ -663,8 +696,10 @@ class UploadViewSet(viewsets.ViewSet):
             return Response({'message': f'Session already {session.status}'})
 
         with transaction.atomic():
-            user = request.user
-            user.refresh_from_db()
+            user = _locked_user(request.user)
+            session = UploadSession.objects.select_for_update().get(pk=session.pk)
+            if session.status in ['READY', 'CANCELLED']:
+                return Response({'message': f'Session already {session.status}'})
             # Reserved bytes were only taken for system-storage uploads.
             if session.storage_account is None:
                 user.storage_reserved = max(0, user.storage_reserved - session.total_size)
