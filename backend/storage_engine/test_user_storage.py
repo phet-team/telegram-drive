@@ -722,6 +722,8 @@ class UserWizardTests(UserStorageTestCase):
         self.assertIn('already linked to another user', res.json()['error'])
         self.assertEqual(self.row().session_string_enc, '')
         self.assertEqual(self.row().tg_user_id, None)
+        self.assertEqual(self.telegram.log_out_calls, 1)
+        self.assertEqual(self.row().pending_login_session_enc, '')
 
     def test_different_telegram_account_with_existing_files_is_409(self):
         account = self.link_account(self.user, session='', tg_user_id=999, status='disconnected',
@@ -732,6 +734,53 @@ class UserWizardTests(UserStorageTestCase):
         self.assertEqual(res.status_code, 409)
         self.assertIn('another Telegram account', res.json()['error'])
         self.assertEqual(self.row().session_string_enc, '')
+        self.assertEqual(self.telegram.log_out_calls, 1)
+        self.assertEqual(self.row().pending_login_session_enc, '')
+
+    def test_finish_user_flood_wait_is_429(self):
+        self.start()
+        self.telegram.script('get_me', None, te.FloodWaitError(request=None, capture=45))
+        res = self.verify()
+        self.assertEqual(res.status_code, 429)
+        self.assertEqual(res['Retry-After'], '45')
+        self.assertIn('Wait 45 seconds', res.json()['error'])
+        self.assertEqual(self.telegram.log_out_calls, 1)
+        self.assertEqual(self.row().pending_login_session_enc, '')
+
+    def test_finish_user_channels_too_much_is_400(self):
+        self.start()
+        self.telegram.script('create_channel', te.ChannelsTooMuchError(request=None))
+        res = self.verify()
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('too many channels', res.json()['error'])
+        self.assertEqual(self.telegram.log_out_calls, 1)
+        self.assertEqual(self.row().pending_login_session_enc, '')
+
+    def test_finish_user_connection_error_is_503(self):
+        self.start()
+        self.telegram.script('get_me', None, ConnectionError("Can't connect to TG"))
+        res = self.verify()
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(res.json()['reason'], 'telegram_unreachable')
+        self.assertEqual(self.telegram.log_out_calls, 1)
+        self.assertEqual(self.row().pending_login_session_enc, '')
+
+    def test_concurrent_race_integrity_error_is_409_and_logs_out(self):
+        from django.db import IntegrityError
+        self.start()
+        orig_save = UserStorageAccount.save
+
+        def fake_save(acc_inst, *args, **kwargs):
+            if kwargs.get('update_fields') == acc_inst.PENDING_FIELDS:
+                return orig_save(acc_inst, *args, **kwargs)
+            raise IntegrityError("UNIQUE constraint failed: drive_userstorageaccount.tg_user_id")
+
+        with mock.patch.object(UserStorageAccount, 'save', autospec=True, side_effect=fake_save):
+            res = self.verify()
+        self.assertEqual(res.status_code, 409)
+        self.assertIn('already linked to another user', res.json()['error'])
+        self.assertEqual(self.telegram.log_out_calls, 1)
+        self.assertEqual(self.row().pending_login_session_enc, '')
 
     def test_same_account_reconnect_keeps_the_channel(self):
         self.link_account(self.user, session='', tg_user_id=ME, status='disconnected',

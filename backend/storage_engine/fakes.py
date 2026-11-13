@@ -91,6 +91,7 @@ class FakeClient:
         from telethon.tl.functions.channels import CreateChannelRequest
 
         if isinstance(request, CreateChannelRequest):
+            self.world.raise_scripted('create_channel')
             chat = SimpleNamespace(id=next(self.world.ids), access_hash=123456789)
             return SimpleNamespace(chats=[chat])
         raise NotImplementedError(f"FakeClient.__call__ {request}")

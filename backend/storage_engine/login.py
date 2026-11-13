@@ -12,6 +12,7 @@ per-user UserStorageAccount row (the user's "Connect my Telegram" flow).
 import logging
 from datetime import timedelta
 
+from django.db import IntegrityError
 from django.utils import timezone
 from telethon import errors as te
 
@@ -139,11 +140,23 @@ def _sign_in(row, **credentials_kw):
         _map_connection_error(exc)
 
 
+def _call_telethon_mapped(coro):
+    try:
+        return _run(coro)
+    except te.FloodWaitError as exc:
+        raise LoginError(f"Too many attempts. Wait {exc.seconds} seconds.", status=429, retry_after=exc.seconds) from exc
+    except te.ChannelsTooMuchError as exc:
+        raise LoginError("Your Telegram account has too many channels. Leave one and try again.", status=400) from exc
+    except Exception as exc:
+        _map_connection_error(exc)
+        raise
+
+
 def _create_channel(client):
     """Creates the user's private storage channel. Returns (channel_id, channel_access_hash)."""
     from telethon.tl.functions.channels import CreateChannelRequest
 
-    res = _run(client(CreateChannelRequest(
+    res = _call_telethon_mapped(client(CreateChannelRequest(
         title=CHANNEL_TITLE,
         about=CHANNEL_ABOUT,
         broadcast=True,
@@ -158,61 +171,83 @@ def _finish_user(user, session_str, target_row):
     refuses an account already linked elsewhere or files that live in another account,
     provisions the storage channel, then saves the row and probes the engine.
     """
-    client = _run(_open_client(session_str))
+    saved = False
+    client = None
     try:
-        me = _run(client.get_me())
-        tg_user_id = me.id
-
-        clash = UserStorageAccount.objects.exclude(pk=target_row.pk).filter(tg_user_id=tg_user_id).first()
-        if clash is not None:
-            raise LoginError("This Telegram account is already linked to another user.", status=409)
-
-        if (target_row.tg_user_id is not None and target_row.tg_user_id != tg_user_id
-                and target_row.files.count() > 0):
-            raise LoginError(
-                f"Your files are stored in another Telegram account ({target_row.tg_display_name}). "
-                "Reconnect that account, or delete those files first.", status=409)
-
-        if not target_row.channel_id or (target_row.tg_user_id != tg_user_id and target_row.files.count() == 0):
-            target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
-
-        first = getattr(me, 'first_name', '') or ''
-        user_name = getattr(me, 'username', '') or ''
-        display_name = f"{first} (@{user_name})" if user_name else first
-        if not display_name:
-            display_name = str(me.id)
-
-        target_row.tg_user_id = tg_user_id
-        target_row.tg_display_name = display_name
-        target_row.session_string_enc = encrypt(session_str)
-        target_row.connected_at = timezone.now()
-        target_row.status = 'ok'
-        target_row.clear_pending_login()
-        target_row.save()
-        credentials.invalidate(account_id=target_row.id)
-        health.reset(key=f"user:{target_row.id}")
-    finally:
         try:
-            _run(client.disconnect())
-        except Exception:
-            logger.warning("Disconnecting the login client failed", exc_info=True)
+            client = _call_telethon_mapped(_open_client(session_str))
+            me = _call_telethon_mapped(client.get_me())
+            tg_user_id = me.id
+
+            clash = UserStorageAccount.objects.exclude(pk=target_row.pk).filter(tg_user_id=tg_user_id).first()
+            if clash is not None:
+                raise LoginError("This Telegram account is already linked to another user.", status=409)
+
+            if (target_row.tg_user_id is not None and target_row.tg_user_id != tg_user_id
+                    and target_row.files.count() > 0):
+                raise LoginError(
+                    f"Your files are stored in another Telegram account ({target_row.tg_display_name}). "
+                    "Reconnect that account, or delete those files first.", status=409)
+
+            if not target_row.channel_id or (target_row.tg_user_id != tg_user_id and target_row.files.count() == 0):
+                target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
+
+            first = getattr(me, 'first_name', '') or ''
+            user_name = getattr(me, 'username', '') or ''
+            display_name = f"{first} (@{user_name})" if user_name else first
+            if not display_name:
+                display_name = str(me.id)
+
+            target_row.tg_user_id = tg_user_id
+            target_row.tg_display_name = display_name
+            target_row.session_string_enc = encrypt(session_str)
+            target_row.connected_at = timezone.now()
+            target_row.status = 'ok'
+            target_row.clear_pending_login()
+            try:
+                target_row.save()
+                saved = True
+            except IntegrityError as exc:
+                raise LoginError("This Telegram account is already linked to another user.", status=409) from exc
+
+            credentials.invalidate(account_id=target_row.id)
+            health.reset(key=f"user:{target_row.id}")
+        finally:
+            if client is not None:
+                try:
+                    _run(client.disconnect())
+                except Exception:
+                    logger.warning("Disconnecting the login client failed", exc_info=True)
+    except Exception:
+        if not saved:
+            logout_client(session_str)
+            try:
+                target_row.clear_pending_login()
+                target_row.save(update_fields=target_row.PENDING_FIELDS)
+            except Exception:
+                logger.warning("Failed to clear pending login on failure", exc_info=True)
+        raise
 
     from storage_engine.selftest import run_selftest  # local import: avoids a cycle at module load
     probe = run_selftest(1, account=target_row)
     if (not probe['ok'] and probe['reason'] == 'channel_unreachable'
             and target_row.files.count() == 0):
         # The channel is gone or was never joined: recreate it once and re-probe.
-        client = _run(_open_client(session_str))
+        client = None
         try:
+            client = _call_telethon_mapped(_open_client(session_str))
             target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
+            target_row.save()
+            credentials.invalidate(account_id=target_row.id)
+            probe = run_selftest(1, account=target_row)
+        except Exception:
+            logger.warning("Recreating channel on selftest probe failure failed", exc_info=True)
         finally:
-            try:
-                _run(client.disconnect())
-            except Exception:
-                logger.warning("Disconnecting the login client failed", exc_info=True)
-        target_row.save()
-        credentials.invalidate(account_id=target_row.id)
-        probe = run_selftest(1, account=target_row)
+            if client is not None:
+                try:
+                    _run(client.disconnect())
+                except Exception:
+                    logger.warning("Disconnecting the login client failed", exc_info=True)
 
     logger.info("User storage session connected for account id=%s by user id=%s", target_row.id, user.id)
     return {
