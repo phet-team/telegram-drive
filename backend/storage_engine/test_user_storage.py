@@ -104,6 +104,11 @@ class UserStorageTestCase(StorageTestCase):
     def stream(self, client, file_id):
         return client.get(f'/api/drive/files/{file_id}/stream/')
 
+    def set_target(self, user, target):
+        """Persist upload_target so it survives refresh_from_db inside API views."""
+        user.upload_target = target
+        user.save(update_fields=['upload_target'])
+
     # -- engine introspection ------------------------------------------------------------------
 
     def user_engine(self, account):
@@ -469,6 +474,33 @@ class DisconnectedAccountDeleteTests(UserStorageTestCase):
             res = self.api(user).delete(f'/api/drive/folders/{folder.id}/')
         self.assertEqual(res.status_code, 204)
         self.assertFalse(FileItem.objects.filter(owner=user).exists())
+
+    def test_replace_disconnected_own_file_with_system_upload_succeeds(self):
+        user = User.objects.create_user(email='replacer@example.com', system_storage_allowed=True)
+        account = self.link_account(user, session='', tg_user_id=ME, status='disconnected')
+        item = FileItem.objects.create(name='ghost.bin', owner=user, size=50, storage_account=account)
+        FileChunk.objects.create(file_item=item, chunk_index=0, telegram_message_id=999,
+                                 telegram_file_id='999', chunk_size=50)
+
+        self.set_target(user, 'system')
+        client = self.api(user)
+        init_res = self.initiate(client, size=60)
+        self.assertEqual(init_res.status_code, 201)
+        session_id = init_res.data['session_id']
+        put_res = self.put_chunk(client, session_id, data=b'B' * 60)
+        self.assertEqual(put_res.status_code, 200)
+
+        with self.assertLogs('drive.views', level='WARNING') as logs:
+            res = self.complete(client, session_id, replace_file_id=item.id)
+        self.assertEqual(res.status_code, 201)
+        item.refresh_from_db()
+        self.assertIsNone(item.storage_account)
+        self.assertEqual(item.size, 60)
+        user.refresh_from_db()
+        self.assertEqual(user.storage_used, 60)
+        self.assertEqual(user.storage_reserved, 0)
+        text = '\n'.join(r.getMessage() for r in logs.records)
+        self.assertIn(str(account.id), text)
 
 
 # --------------------------------------------------------------------------- test 6: pool

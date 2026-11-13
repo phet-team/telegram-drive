@@ -586,12 +586,19 @@ class UploadViewSet(viewsets.ViewSet):
 
             if old_file:
                 # Delete the old chunks from whichever storage currently holds them.
-                old_engine = engine_for(old_file.storage_account)
-                for oc in old_file.chunks.all():
-                    try:
-                        old_engine.delete_chunk(oc.telegram_message_id)
-                    except Exception:
-                        pass
+                old_acc = old_file.storage_account
+                if old_acc is not None and not old_acc.has_session:
+                    logger.warning(
+                        "Storage disconnected for account %s; deleting DB records while leaving messages in user channel",
+                        old_acc.id,
+                    )
+                else:
+                    old_engine = engine_for(old_acc)
+                    for oc in old_file.chunks.all():
+                        try:
+                            old_engine.delete_chunk(oc.telegram_message_id)
+                        except Exception:
+                            pass
                 old_file.chunks.all().delete()
 
                 # Quota: only the system-storage side of the swap touches the owner's counters.
