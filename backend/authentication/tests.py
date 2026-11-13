@@ -288,7 +288,8 @@ class ApiTokenScopeTests(TestCase):
     def setUp(self):
         cache.clear()
         self.client = APIClient()
-        self.user = User.objects.create_user(email='scopeuser@example.com', password='Password123!')
+        self.user = User.objects.create_user(email='scopeuser@example.com', password='Password123!',
+                                             system_storage_allowed=True)
         self.folder = Folder.objects.create(name='scope-root', owner=self.user)
         FileItem.objects.create(
             name='note.txt', folder=self.folder, owner=self.user, size=10, mime_type='text/plain',

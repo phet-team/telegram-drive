@@ -1,10 +1,13 @@
 """
 Server-side Telegram login ("Reconnect Telegram" wizard).
 
-The in-progress login lives in the StorageSettings row (not in process memory) because
+The in-progress login lives in the DB row (not in process memory) because
 gunicorn requests can land on different workers: the not-yet-authorised Telethon session
 and Telegram's phone_code_hash are stored Fernet-encrypted for at most 5 minutes.
 The code and the 2-step password are passed straight to Telegram and never stored or logged.
+
+Two targets are supported: the system singleton (StorageSettings, admin flow) and a
+per-user UserStorageAccount row (the user's "Connect my Telegram" flow).
 """
 import logging
 from datetime import timedelta
@@ -13,7 +16,7 @@ from django.utils import timezone
 from telethon import errors as te
 
 from config.env_schema import config
-from drive.models import StorageSettings
+from drive.models import StorageSettings, UserStorageAccount
 from storage_engine import client as engine_client, credentials, health
 from storage_engine.errors import StorageUnavailable
 from storage_engine.secrets import decrypt, encrypt, CredentialsUnreadable
@@ -21,6 +24,9 @@ from storage_engine.secrets import decrypt, encrypt, CredentialsUnreadable
 logger = logging.getLogger(__name__)
 
 PENDING_TTL = timedelta(minutes=5)
+
+CHANNEL_TITLE = 'Telegram Drive Storage'
+CHANNEL_ABOUT = 'Files stored by Telegram Drive. Deleting this channel deletes your files.'
 
 
 class LoginError(Exception):
@@ -62,7 +68,7 @@ def _pending(row):
         raise LoginError("The pending login cannot be read. Start again.", status=400) from exc
 
 
-def start(user, phone):
+def start(user, phone, target_row=None):
     async def _start():
         client = _new_client()
         await client.connect()
@@ -88,12 +94,12 @@ def start(user, phone):
     except Exception as exc:
         _map_connection_error(exc)
 
-    row = StorageSettings.get_solo()
+    row = target_row if target_row is not None else StorageSettings.get_solo()
     row.pending_login_session_enc = encrypt(session_str)
     row.pending_phone = phone
     row.pending_code_hash = encrypt(code_hash)
     row.pending_expires_at = timezone.now() + PENDING_TTL
-    row.save(update_fields=StorageSettings.PENDING_FIELDS)
+    row.save(update_fields=row.PENDING_FIELDS)
     return int(PENDING_TTL.total_seconds())
 
 
@@ -133,8 +139,99 @@ def _sign_in(row, **credentials_kw):
         _map_connection_error(exc)
 
 
-def _finish(user, session_str, account):
+def _create_channel(client):
+    """Creates the user's private storage channel. Returns (channel_id, channel_access_hash)."""
+    from telethon.tl.functions.channels import CreateChannelRequest
+
+    res = _run(client(CreateChannelRequest(
+        title=CHANNEL_TITLE,
+        about=CHANNEL_ABOUT,
+        broadcast=True,
+    )))
+    channel = res.chats[0]
+    return channel.id, getattr(channel, 'access_hash', 0)
+
+
+def _finish_user(user, session_str, target_row):
+    """
+    Completes the wizard for a per-user account: verifies the Telegram identity,
+    refuses an account already linked elsewhere or files that live in another account,
+    provisions the storage channel, then saves the row and probes the engine.
+    """
+    client = _run(_open_client(session_str))
+    try:
+        me = _run(client.get_me())
+        tg_user_id = me.id
+
+        clash = UserStorageAccount.objects.exclude(pk=target_row.pk).filter(tg_user_id=tg_user_id).first()
+        if clash is not None:
+            raise LoginError("This Telegram account is already linked to another user.", status=409)
+
+        if (target_row.tg_user_id is not None and target_row.tg_user_id != tg_user_id
+                and target_row.files.count() > 0):
+            raise LoginError(
+                f"Your files are stored in another Telegram account ({target_row.tg_display_name}). "
+                "Reconnect that account, or delete those files first.", status=409)
+
+        if not target_row.channel_id or (target_row.tg_user_id != tg_user_id and target_row.files.count() == 0):
+            target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
+
+        first = getattr(me, 'first_name', '') or ''
+        user_name = getattr(me, 'username', '') or ''
+        display_name = f"{first} (@{user_name})" if user_name else first
+        if not display_name:
+            display_name = str(me.id)
+
+        target_row.tg_user_id = tg_user_id
+        target_row.tg_display_name = display_name
+        target_row.session_string_enc = encrypt(session_str)
+        target_row.connected_at = timezone.now()
+        target_row.status = 'ok'
+        target_row.clear_pending_login()
+        target_row.save()
+        credentials.invalidate(account_id=target_row.id)
+        health.reset(key=f"user:{target_row.id}")
+    finally:
+        try:
+            _run(client.disconnect())
+        except Exception:
+            logger.warning("Disconnecting the login client failed", exc_info=True)
+
+    from storage_engine.selftest import run_selftest  # local import: avoids a cycle at module load
+    probe = run_selftest(1, account=target_row)
+    if (not probe['ok'] and probe['reason'] == 'channel_unreachable'
+            and target_row.files.count() == 0):
+        # The channel is gone or was never joined: recreate it once and re-probe.
+        client = _run(_open_client(session_str))
+        try:
+            target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
+        finally:
+            try:
+                _run(client.disconnect())
+            except Exception:
+                logger.warning("Disconnecting the login client failed", exc_info=True)
+        target_row.save()
+        credentials.invalidate(account_id=target_row.id)
+        probe = run_selftest(1, account=target_row)
+
+    logger.info("User storage session connected for account id=%s by user id=%s", target_row.id, user.id)
+    return {
+        'ok': True, 'account': display_name,
+        'storage_ok': probe['ok'], 'storage_step': probe['failed_step'], 'storage_reason': probe['reason'],
+    }
+
+
+async def _open_client(session_str):
+    client = _new_client(session_str)
+    await client.connect()
+    return client
+
+
+def _finish(user, session_str, account, target_row=None):
     """Saves the new session, then probes storage with a send-and-delete message."""
+    if isinstance(target_row, UserStorageAccount):
+        return _finish_user(user, session_str, target_row)
+
     row = StorageSettings.get_solo()
     row.session_string_enc = encrypt(session_str)
     row.auth_mode = StorageSettings.AUTH_SESSION
@@ -153,23 +250,45 @@ def _finish(user, session_str, account):
     }
 
 
-def verify_code(user, code):
-    row = StorageSettings.get_solo()
+def verify_code(user, code, target_row=None):
+    row = target_row if target_row is not None else StorageSettings.get_solo()
     outcome, session_str, account = _sign_in(row, code=code.strip().replace(' ', ''))
     if outcome == 'password':
         row.pending_login_session_enc = encrypt(session_str)
         row.save(update_fields=['pending_login_session_enc'])
         return {'ok': False, 'needs_password': True}
-    return _finish(user, session_str, account)
+    return _finish(user, session_str, account, target_row=target_row)
 
 
-def verify_password(user, password):
-    row = StorageSettings.get_solo()
+def verify_password(user, password, target_row=None):
+    row = target_row if target_row is not None else StorageSettings.get_solo()
     _, session_str, account = _sign_in(row, password=password)
-    return _finish(user, session_str, account)
+    return _finish(user, session_str, account, target_row=target_row)
 
 
-def cancel():
-    row = StorageSettings.get_solo()
+def cancel(target_row=None):
+    row = target_row if target_row is not None else StorageSettings.get_solo()
     row.clear_pending_login()
-    row.save(update_fields=StorageSettings.PENDING_FIELDS)
+    row.save(update_fields=row.PENDING_FIELDS)
+
+
+def logout_client(session_str):
+    """
+    Best-effort `client.log_out()` for the account behind `session_str`: at most 10 s,
+    never raises, never blocks the caller (used on disconnect and before deleting a user).
+    """
+    if not session_str:
+        return
+
+    async def _logout():
+        client = _new_client(session_str)
+        await client.connect()
+        try:
+            await client.log_out()
+        finally:
+            await client.disconnect()
+
+    try:
+        engine_client.get_telethon_thread().run_coro(_logout(), timeout=10)
+    except Exception:
+        logger.warning("Telegram log_out failed; continuing without it", exc_info=True)

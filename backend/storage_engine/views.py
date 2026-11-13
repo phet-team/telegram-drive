@@ -2,16 +2,23 @@ import logging
 import re
 from urllib.parse import urlparse
 
+from django.contrib.auth import get_user_model
+from django.db.models import Q, Sum
+from django.shortcuts import get_object_or_404
 from rest_framework import permissions, serializers, status, views
+from rest_framework.generics import GenericAPIView
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 
 from authentication.token_permissions import ApiTokenScopePermission, get_api_token
-from drive.models import StorageSettings
-from storage_engine import alerts, credentials, health, login
+from drive.models import FileItem, StorageSettings, UserStorageAccount
+from storage_engine import accounts, alerts, credentials, health, login
 from storage_engine.errors import StorageEngineError
 from storage_engine.secrets import decrypt, CredentialsUnreadable
 from storage_engine.selftest import run_selftest
+
+User = get_user_model()
 
 logger = logging.getLogger(__name__)
 
@@ -259,3 +266,234 @@ class StorageLoginCancelView(StorageAdminView):
     def post(self, request):
         login.cancel()
         return Response({'ok': True})
+# -- Per-user storage ("My storage") ---------------------------------------------------------------------
+
+class IsNormalUser(permissions.BasePermission):
+    """Authenticated with a normal login. API tokens never qualify."""
+    message = "Only normal logins can manage personal storage."
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user and user.is_authenticated and get_api_token(request) is None)
+
+
+class UserStorageView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated, IsNormalUser]
+
+
+def serialize_user_storage_me(user):
+    """Full view of the caller's storage state. Never includes secrets."""
+    account = getattr(user, 'storage_account', None)
+    own_connected = bool(account and account.has_session)
+    file_qs = account.files.all() if account else FileItem.objects.none()
+    file_count = file_qs.count()
+    bytes_used = file_qs.aggregate(total=Sum('size'))['total'] or 0
+
+    try:
+        target = accounts.resolve_upload_target(user)
+        effective_target = 'own' if target else 'system'
+        can_upload = True
+    except accounts.StorageNotConnected:
+        effective_target = None
+        can_upload = False
+
+    return {
+        'system_allowed': user.can_use_system_storage,
+        'upload_target': user.upload_target,
+        'effective_target': effective_target,
+        'can_upload': can_upload,
+        'own': {
+            'connected': own_connected,
+            'status': account.status if account else 'disconnected',
+            'reason': account.last_check_reason if account else '',
+            'account_name': account.tg_display_name if account else '',
+            'connected_at': account.connected_at if account else None,
+            'file_count': file_count,
+            'bytes': bytes_used,
+        },
+        'login_pending': account.login_seconds_left() > 0 if account else False,
+        'login_seconds_left': account.login_seconds_left() if account else 0,
+        'system_quota': {
+            'used': user.storage_used,
+            'reserved': user.storage_reserved,
+            'quota': user.storage_quota,
+        },
+    }
+
+
+class UserStorageMeView(UserStorageView):
+    def get(self, request):
+        return Response(serialize_user_storage_me(request.user))
+
+    def put(self, request):
+        target = request.data.get('upload_target')
+        if target not in ('own', 'system'):
+            raise serializers.ValidationError({"upload_target": "Invalid upload_target"})
+        if target == 'system' and not request.user.can_use_system_storage:
+            return Response({'error': 'System storage is not allowed for your account.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        account = getattr(request.user, 'storage_account', None)
+        if target == 'own' and (not account or not account.has_session):
+            return Response({'error': 'Connect your Telegram account first.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        request.user.upload_target = target
+        request.user.save(update_fields=['upload_target'])
+        return Response(serialize_user_storage_me(request.user))
+
+
+def _my_account(request) -> UserStorageAccount:
+    """
+    The caller's UserStorageAccount row, created on first use. Read through the
+    request.user related instance (and created with user=request.user) so the
+    instance the login flow writes is also the instance later reads see.
+    """
+    account = getattr(request.user, 'storage_account', None)
+    if account is None:
+        account, _ = UserStorageAccount.objects.get_or_create(user=request.user)
+    return account
+
+
+class UserStorageLoginStartView(UserStorageView):
+    throttle_classes = [LoginStartThrottle]
+
+    def post(self, request):
+        serializer = LoginStartSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            expires_in = login.start(request.user, serializer.validated_data['phone'],
+                                     target_row=_my_account(request))
+        except login.LoginError as exc:
+            return _login_error(exc)
+        return Response({'ok': True, 'expires_in': expires_in})
+
+
+class UserStorageLoginVerifyView(UserStorageView):
+    def post(self, request):
+        serializer = LoginCodeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            return Response(login.verify_code(request.user, serializer.validated_data['code'],
+                                              target_row=_my_account(request)))
+        except login.LoginError as exc:
+            return _login_error(exc)
+
+
+class UserStorageLoginPasswordView(UserStorageView):
+    def post(self, request):
+        serializer = LoginPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            return Response(login.verify_password(request.user, serializer.validated_data['password'],
+                                                  target_row=_my_account(request)))
+        except login.LoginError as exc:
+            return _login_error(exc)
+
+
+class UserStorageLoginCancelView(UserStorageView):
+    def post(self, request):
+        login.cancel(target_row=_my_account(request))
+        return Response({'ok': True})
+
+
+class UserStorageTestView(UserStorageView):
+    def post(self, request):
+        account = getattr(request.user, 'storage_account', None)
+        if not account or not account.has_session:
+            return Response({'ok': False, 'reason': 'storage_not_connected'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        ok, reason = health.check_health(account=account, force=True)
+        return Response({'ok': ok, 'reason': reason})
+
+
+class UserStorageDisconnectView(UserStorageView):
+    """Drops the session locally. The user should also revoke it in Telegram; we log out best effort."""
+    def post(self, request):
+        account = getattr(request.user, 'storage_account', None)
+        if account and account.has_session:
+            try:
+                login.logout_client(decrypt(account.session_string_enc))
+            except Exception:
+                pass
+            account.session_string_enc = ''
+            account.status = 'disconnected'
+            account.save()
+            credentials.invalidate(account_id=account.id)
+            health.reset(key=f"user:{account.id}")
+        return Response({'ok': True})
+
+
+# -- User management (superuser) -------------------------------------------------------------------------
+
+class AdminUserListPagination(PageNumberPagination):
+    page_size = 50
+
+
+def serialize_admin_user(user):
+    account = getattr(user, 'storage_account', None)
+    file_qs = account.files.all() if account else FileItem.objects.none()
+    return {
+        'id': user.id,
+        'email': user.email,
+        'name': user.name,
+        'is_active': user.is_active,
+        'is_superuser': user.is_superuser,
+        'date_joined': user.date_joined,
+        'system_storage_allowed': user.system_storage_allowed,
+        'can_use_system_storage': user.can_use_system_storage,
+        'storage_quota': user.storage_quota,
+        'storage_used': user.storage_used,
+        'own': {
+            'connected': bool(account and account.has_session),
+            'status': account.status if account else 'disconnected',
+            'reason': account.last_check_reason if account else '',
+            'account_name': account.tg_display_name if account else '',
+            'file_count': file_qs.count(),
+            'bytes': file_qs.aggregate(total=Sum('size'))['total'] or 0,
+        },
+    }
+
+
+class AdminUsersView(GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated, ApiTokenScopePermission, IsStorageAdmin]
+    pagination_class = AdminUserListPagination
+
+    def get(self, request):
+        qs = User.objects.all().order_by('id')
+        search = request.query_params.get('search', '').strip()
+        if search:
+            qs = qs.filter(Q(email__icontains=search) | Q(name__icontains=search))
+        page = self.paginate_queryset(qs)
+        results = [serialize_admin_user(u) for u in page]
+        return self.get_paginated_response(results)
+
+
+class AdminUserDetailView(StorageAdminView):
+    def patch(self, request, pk):
+        target = get_object_or_404(User, pk=pk)
+        fields = {}
+        for field in ('system_storage_allowed', 'is_active'):
+            if field in request.data:
+                fields[field] = bool(request.data[field])
+        if 'storage_quota' in request.data:
+            raw = request.data['storage_quota']
+            if raw is None:
+                fields['storage_quota'] = None
+            else:
+                try:
+                    quota = int(raw)
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError({"storage_quota": "Must be null or an integer >= 0."})
+                if quota < 0:
+                    raise serializers.ValidationError({"storage_quota": "Must be null or an integer >= 0."})
+                fields['storage_quota'] = quota
+
+        if fields.get('is_active') is False and target.pk == request.user.pk:
+            return Response({'error': 'Cannot deactivate yourself.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        changed = sorted(f for f, v in fields.items() if getattr(target, f) != v)
+        if changed:
+            for field in changed:
+                setattr(target, field, fields[field])
+            target.save(update_fields=changed)
+            logger.info("User id=%s updated by admin id=%s fields=%s", target.pk, request.user.id, changed)
+        return Response(serialize_admin_user(target))

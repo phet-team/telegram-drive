@@ -128,7 +128,8 @@ class UploadAndStreamingTests(TestCase):
         self.user = User.objects.create_user(
             email="uploader@test.com",
             password="password123",
-            storage_quota=5000  # 5,000 bytes limit
+            storage_quota=5000,  # 5,000 bytes limit
+            system_storage_allowed=True,  # pre-existing user: may use the system storage
         )
         self.client.force_authenticate(user=self.user)
 
@@ -391,7 +392,8 @@ class ApiTokenFolderRestrictionTests(TestCase):
     def setUp(self):
         cache.clear()
         self.client = APIClient()
-        self.user = User.objects.create_user(email='restricted@example.com', password='password123')
+        self.user = User.objects.create_user(email='restricted@example.com', password='password123',
+                                             system_storage_allowed=True)
         self.stranger = User.objects.create_user(email='stranger2@example.com', password='password123')
 
         self.root = Folder.objects.create(name='gen-image', owner=self.user)

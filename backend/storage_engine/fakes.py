@@ -81,6 +81,19 @@ class FakeClient:
         )
         return self.world.me
 
+    async def log_out(self):
+        self.world.log_out_calls += 1
+        return True
+
+    async def __call__(self, request):
+        """Telethon clients are callable for TL requests; the fake understands channel creation."""
+        from telethon.tl.functions.channels import CreateChannelRequest
+
+        if isinstance(request, CreateChannelRequest):
+            chat = SimpleNamespace(id=next(self.world.ids), access_hash=123456789)
+            return SimpleNamespace(chats=[chat])
+        raise NotImplementedError(f"FakeClient.__call__ {request}")
+
 
 class FakeTelegram:
     """Shared state behind every FakeClient: stored messages, scripted errors, recorded calls."""
@@ -93,8 +106,9 @@ class FakeTelegram:
         self.chats = []
         self.code_requests = []
         self.sign_ins = []
+        self.log_out_calls = 0
         self.clients = []
-        self.me = SimpleNamespace(first_name='Alice')
+        self.me = SimpleNamespace(first_name='Alice', id=5550001)
         self.scripted = {}  # method name -> list of exceptions raised one per call, in order
 
     def next_session(self):

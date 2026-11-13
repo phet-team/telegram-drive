@@ -35,7 +35,7 @@ from authentication.token_permissions import (
     get_api_token, enforce_token_subtree, is_in_subtree, ApiTokenScopePermission,
 )
 from storage_engine import health
-from storage_engine.client import get_storage_engine
+from storage_engine.accounts import engine_for, resolve_upload_target
 from storage_engine.errors import ContentUnavailable, StorageUnavailable
 from storage_engine.signed_token import generate_media_token, verify_media_token, parse_and_verify_media_token
 from config.env_schema import config
@@ -190,16 +190,30 @@ class FolderViewSet(viewsets.ModelViewSet):
         FileItem.objects.filter(folder__in=all_folders).exclude(owner=request.user).update(folder=None)
         Folder.objects.filter(parent__in=all_folders).exclude(owner=request.user).update(parent=None)
 
-        # Cleanup Telegram chunks and quota for user's files inside
-        engine = get_storage_engine()
+        # Cleanup Telegram chunks and quota for user's files inside, grouped by storage account.
         user_files = list(FileItem.objects.filter(folder__in=all_folders, owner=request.user))
-        total_freed = sum(f.size for f in user_files)
+        by_account = {}
         for f in user_files:
-            for c in f.chunks.all():
-                try:
-                    engine.delete_chunk(c.telegram_message_id)
-                except Exception:
-                    pass
+            by_account.setdefault(f.storage_account, []).append(f)
+        for storage_account, group_files in by_account.items():
+            if storage_account is not None and not storage_account.has_session:
+                logger.warning(
+                    "Storage disconnected for account %s; deleting DB records while leaving messages in user channel",
+                    storage_account.id,
+                )
+                continue
+            health.raise_if_known_down(key='system' if storage_account is None else f"user:{storage_account.id}")
+            engine = engine_for(storage_account)
+            for f in group_files:
+                for c in f.chunks.all():
+                    try:
+                        engine.delete_chunk(c.telegram_message_id)
+                    except Exception:
+                        pass
+
+        # Quota only tracks files in the system storage; a disconnected account's messages
+        # stay in the user's own channel, so only system-file sizes are freed here.
+        total_freed = sum(f.size for f in user_files if f.storage_account is None)
         if total_freed > 0:
             request.user.storage_used = max(0, request.user.storage_used - total_freed)
             request.user.save(update_fields=['storage_used'])
@@ -339,29 +353,39 @@ class FileItemViewSet(viewsets.ModelViewSet):
         file_item = self.get_object()
         if not can_delete_forever(request.user, file_item):
             raise PermissionDenied("Only the file owner can delete permanently.")
-        health.raise_if_known_down()
 
-        # In-System hard delete & Best-effort Telegram deleteMessage
-        engine = get_storage_engine()
-        chunks = list(file_item.chunks.all())
-        file_size = file_item.size
-        owner = file_item.owner
-
-        with transaction.atomic():
-            file_item.delete()
-            # Restore user storage quota
-            owner.storage_used = max(0, owner.storage_used - file_size)
-            owner.save(update_fields=['storage_used'])
-
-        # Best effort Telegram message cleanup
-        try:
-            for chunk in chunks:
-                engine.delete_chunk(chunk.telegram_message_id)
-        except StorageUnavailable as exc:
+        acc = file_item.storage_account
+        if acc is not None and not acc.has_session:
             logger.warning(
-                "File %s deleted locally but its storage messages could not be removed (reason=%s)",
-                file_item.id, exc.reason,
+                "Storage disconnected for account %s; deleting DB records while leaving messages in user channel",
+                acc.id,
             )
+            # Not a system file: the DB row goes away, quota untouched, messages stay in the channel.
+            with transaction.atomic():
+                file_item.delete()
+        else:
+            health.raise_if_known_down(key=f"user:{acc.id}" if acc else 'system')
+            engine = engine_for(acc)
+            chunks = list(file_item.chunks.all())
+            file_size = file_item.size
+            owner = file_item.owner
+
+            with transaction.atomic():
+                file_item.delete()
+                # Restore quota only for files that counted against the owner's system storage.
+                if acc is None:
+                    owner.storage_used = max(0, owner.storage_used - file_size)
+                    owner.save(update_fields=['storage_used'])
+
+            # Best effort Telegram message cleanup
+            try:
+                for chunk in chunks:
+                    engine.delete_chunk(chunk.telegram_message_id)
+            except StorageUnavailable as exc:
+                logger.warning(
+                    "File %s deleted locally but storage messages could not be removed: %s",
+                    file_item.id, exc.reason,
+                )
 
         return Response({'message': 'File permanently deleted'})
 
@@ -417,16 +441,21 @@ class UploadViewSet(viewsets.ViewSet):
         expected_sha256 = request.data.get('expected_sha256', '')
         mime_type = request.data.get('mime_type', 'application/octet-stream')
 
-        # Refuse early (503) when storage is known to be down: no quota reserved, no session created
-        health.raise_if_known_down()
+        # Resolve where the bytes go: the user's own connected account, or None for the system
+        # storage. A user with neither raises StorageNotConnected, handled as 409.
+        target_account = resolve_upload_target(user)
 
-        # 1. Atomic quota check & reservation (if quota is configured)
+        # Refuse early (503) when storage is known to be down: no quota reserved, no session created
+        health.raise_if_known_down(key='system' if target_account is None else f"user:{target_account.id}")
+
+        # 1. Quota is tracked only for system-storage uploads: atomic check & reservation
         with transaction.atomic():
-            user.refresh_from_db()
-            if user.storage_quota is not None and user.available_quota < total_size:
-                raise ValidationError("Insufficient storage quota.")
-            user.storage_reserved += total_size
-            user.save(update_fields=['storage_reserved'])
+            if target_account is None:
+                user.refresh_from_db()
+                if user.storage_quota is not None and user.available_quota < total_size:
+                    raise ValidationError("Insufficient storage quota.")
+                user.storage_reserved += total_size
+                user.save(update_fields=['storage_reserved'])
 
             # Telegram MTProto Policy Limits:
             # - Hard floor: 1 MB (prevents FloodWait error from excessive message creation)
@@ -463,7 +492,8 @@ class UploadViewSet(viewsets.ViewSet):
                 chunk_size=chunk_size,
                 total_chunks=total_chunks,
                 expected_sha256=expected_sha256,
-                expires_at=timezone.now() + timedelta(hours=24)
+                expires_at=timezone.now() + timedelta(hours=24),
+                storage_account=target_account
             )
 
         return Response({
@@ -492,7 +522,7 @@ class UploadViewSet(viewsets.ViewSet):
             raise ValidationError("Chunk payload exceeds session chunk size limit.")
 
         chunk_hash = hashlib.sha256(chunk_data).hexdigest()
-        engine = get_storage_engine()
+        engine = engine_for(session.storage_account)
 
         # Upload to Telegram or Mock Storage
         msg_id, file_id = engine.upload_chunk(
@@ -543,38 +573,44 @@ class UploadViewSet(viewsets.ViewSet):
             user = request.user
             user.refresh_from_db()
 
-            engine = get_storage_engine()
             replace_file_id = request.data.get('replace_file_id')
             old_file = None
             if replace_file_id:
                 old_file = FileItem.objects.filter(pk=replace_file_id, owner=user, is_trashed=False).first()
 
             if old_file:
-                size_diff = session.total_size - old_file.size
-                user.storage_reserved = max(0, user.storage_reserved - session.total_size)
-                user.storage_used = max(0, user.storage_used + size_diff)
-                user.save(update_fields=['storage_reserved', 'storage_used'])
-
-                # Delete old chunks from storage
+                # Delete the old chunks from whichever storage currently holds them.
+                old_engine = engine_for(old_file.storage_account)
                 for oc in old_file.chunks.all():
                     try:
-                        engine.delete_chunk(oc.telegram_message_id)
+                        old_engine.delete_chunk(oc.telegram_message_id)
                     except Exception:
                         pass
                 old_file.chunks.all().delete()
 
-                # Update existing FileItem
+                # Quota: only the system-storage side of the swap touches the owner's counters.
+                if session.storage_account is None:
+                    user.storage_reserved = max(0, user.storage_reserved - session.total_size)
+                    user.storage_used = max(0, user.storage_used + session.total_size)
+                if old_file.storage_account is None:
+                    user.storage_used = max(0, user.storage_used - old_file.size)
+                user.storage_used = max(0, user.storage_used)
+                user.save(update_fields=['storage_reserved', 'storage_used'])
+
+                # Update existing FileItem, repointing it to the upload's storage account.
                 old_file.name = session.filename
                 old_file.size = session.total_size
                 old_file.mime_type = session.mime_type
                 old_file.sha256 = session.expected_sha256
+                old_file.storage_account = session.storage_account
                 old_file.save()
                 file_item = old_file
             else:
-                # Atomically adjust quota
-                user.storage_reserved = max(0, user.storage_reserved - session.total_size)
-                user.storage_used += session.total_size
-                user.save(update_fields=['storage_reserved', 'storage_used'])
+                # Atomically adjust quota (system storage only)
+                if session.storage_account is None:
+                    user.storage_reserved = max(0, user.storage_reserved - session.total_size)
+                    user.storage_used += session.total_size
+                    user.save(update_fields=['storage_reserved', 'storage_used'])
 
                 # Create FileItem
                 file_item = FileItem.objects.create(
@@ -583,7 +619,8 @@ class UploadViewSet(viewsets.ViewSet):
                     owner=user,
                     size=session.total_size,
                     mime_type=session.mime_type,
-                    sha256=session.expected_sha256
+                    sha256=session.expected_sha256,
+                    storage_account=session.storage_account
                 )
 
             # Map chunks
@@ -615,8 +652,10 @@ class UploadViewSet(viewsets.ViewSet):
         with transaction.atomic():
             user = request.user
             user.refresh_from_db()
-            user.storage_reserved = max(0, user.storage_reserved - session.total_size)
-            user.save(update_fields=['storage_reserved'])
+            # Reserved bytes were only taken for system-storage uploads.
+            if session.storage_account is None:
+                user.storage_reserved = max(0, user.storage_reserved - session.total_size)
+                user.save(update_fields=['storage_reserved'])
 
             session.status = 'CANCELLED'
             session.save(update_fields=['status', 'updated_at'])
@@ -683,7 +722,7 @@ class FileStreamView(views.APIView):
             resp['Vary'] = 'Authorization, Range'
             return resp
 
-        engine = get_storage_engine()
+        engine = engine_for(file_item.storage_account)
         chunks_qs = list(file_item.chunks.order_by('chunk_index'))
         if not chunks_qs:
             raise Http404("File content not found.")

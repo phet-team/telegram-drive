@@ -179,7 +179,8 @@ class EnginePolicyTests(StorageTestCase):
 class ApiBehaviourTests(StorageTestCase):
     def setUp(self):
         super().setUp()
-        self.user = User.objects.create_user(email='u@example.com', password='Password123!')
+        self.user = User.objects.create_user(email='u@example.com', password='Password123!',
+                                             system_storage_allowed=True)
         self.client = APIClient(raise_request_exception=False)
         self.client.force_authenticate(user=self.user)
         self.use_db_session('SESSION-A')
