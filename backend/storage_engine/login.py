@@ -14,10 +14,11 @@ from datetime import timedelta
 
 from django.db import IntegrityError
 from django.utils import timezone
+from django.views.decorators.debug import sensitive_variables
 from telethon import errors as te
 
 from config.env_schema import config
-from drive.models import StorageSettings, UserStorageAccount
+from drive.models import StorageSettings, UploadSession, UserStorageAccount
 from storage_engine import client as engine_client, credentials, health
 from storage_engine.errors import StorageUnavailable
 from storage_engine.secrets import decrypt, encrypt, CredentialsUnreadable
@@ -62,6 +63,9 @@ def _pending(row):
     """Returns (session_str, phone, code_hash) of a live pending login, or raises LoginError."""
     if (not row.pending_login_session_enc or not row.pending_expires_at
             or row.pending_expires_at <= timezone.now()):
+        if row.pending_login_session_enc or row.pending_phone:  # expired: drop the half-login and the phone
+            row.clear_pending_login()
+            row.save(update_fields=row.PENDING_FIELDS)
         raise LoginError("No login in progress or it has expired. Start again.", status=400)
     try:
         return decrypt(row.pending_login_session_enc), row.pending_phone, decrypt(row.pending_code_hash)
@@ -69,7 +73,9 @@ def _pending(row):
         raise LoginError("The pending login cannot be read. Start again.", status=400) from exc
 
 
+@sensitive_variables('phone', 'session_str', 'code_hash')
 def start(user, phone, target_row=None):
+    @sensitive_variables('phone')
     async def _start():
         client = _new_client()
         await client.connect()
@@ -104,10 +110,12 @@ def start(user, phone, target_row=None):
     return int(PENDING_TTL.total_seconds())
 
 
+@sensitive_variables('credentials_kw', 'session_str', 'phone', 'code_hash')
 def _sign_in(row, **credentials_kw):
     """Signs in with the pending session. Returns ('ok', session, first_name) or ('password', session, None)."""
     session_str, phone, code_hash = _pending(row)
 
+    @sensitive_variables('credentials_kw', 'session_str', 'phone', 'code_hash')
     async def _verify():
         client = _new_client(session_str)
         await client.connect()
@@ -165,6 +173,17 @@ def _create_channel(client):
     return channel.id, getattr(channel, 'access_hash', 0)
 
 
+def _drop_inflight_uploads(target_row):
+    """
+    The account's channel changed: chunks of unfinished uploads went to the old channel, so those
+    sessions can never complete correctly. Cancel them (own uploads reserve no quota) and forget
+    cached chunks of this account.
+    """
+    UploadSession.objects.filter(storage_account=target_row, status='UPLOADING').update(status='CANCELLED')
+    engine_client.purge_chunk_cache(f"user:{target_row.id}")
+
+
+@sensitive_variables('session_str')
 def _finish_user(user, session_str, target_row):
     """
     Completes the wizard for a per-user account: verifies the Telegram identity,
@@ -189,8 +208,10 @@ def _finish_user(user, session_str, target_row):
                     f"Your files are stored in another Telegram account ({target_row.tg_display_name}). "
                     "Reconnect that account, or delete those files first.", status=409)
 
+            channel_changed = False
             if not target_row.channel_id or (target_row.tg_user_id != tg_user_id and target_row.files.count() == 0):
                 target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
+                channel_changed = True
 
             first = getattr(me, 'first_name', '') or ''
             user_name = getattr(me, 'username', '') or ''
@@ -210,6 +231,8 @@ def _finish_user(user, session_str, target_row):
             except IntegrityError as exc:
                 raise LoginError("This Telegram account is already linked to another user.", status=409) from exc
 
+            if channel_changed:
+                _drop_inflight_uploads(target_row)
             credentials.invalidate(account_id=target_row.id)
             health.reset(key=f"user:{target_row.id}")
         finally:
@@ -238,6 +261,7 @@ def _finish_user(user, session_str, target_row):
             client = _call_telethon_mapped(_open_client(session_str))
             target_row.channel_id, target_row.channel_access_hash = _create_channel(client)
             target_row.save()
+            _drop_inflight_uploads(target_row)
             credentials.invalidate(account_id=target_row.id)
             probe = run_selftest(1, account=target_row)
         except Exception:
@@ -285,6 +309,7 @@ def _finish(user, session_str, account, target_row=None):
     }
 
 
+@sensitive_variables('code', 'session_str')
 def verify_code(user, code, target_row=None):
     row = target_row if target_row is not None else StorageSettings.get_solo()
     outcome, session_str, account = _sign_in(row, code=code.strip().replace(' ', ''))
@@ -295,6 +320,7 @@ def verify_code(user, code, target_row=None):
     return _finish(user, session_str, account, target_row=target_row)
 
 
+@sensitive_variables('password', 'session_str')
 def verify_password(user, password, target_row=None):
     row = target_row if target_row is not None else StorageSettings.get_solo()
     _, session_str, account = _sign_in(row, password=password)
@@ -307,6 +333,7 @@ def cancel(target_row=None):
     row.save(update_fields=row.PENDING_FIELDS)
 
 
+@sensitive_variables('session_str')
 def logout_client(session_str):
     """
     Best-effort `client.log_out()` for the account behind `session_str`: at most 10 s,

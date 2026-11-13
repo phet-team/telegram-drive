@@ -269,9 +269,10 @@ class LoginWizardTests(AdminTestCase):
         self.assertEqual(self.row().pending_login_session_enc, '')
 
     def test_start_is_throttled_to_5_per_hour_per_user(self):
-        for _ in range(5):
-            self.assertEqual(self.start().status_code, 200)
-        self.assertEqual(self.start().status_code, 429)
+        # distinct numbers: this checks the per-user limit, not the per-phone one
+        for i in range(5):
+            self.assertEqual(self.start(phone=f'+6681234560{i}').status_code, 200)
+        self.assertEqual(self.start(phone='+66812345609').status_code, 429)
 
     def test_start_error_mapping(self):
         cases = [

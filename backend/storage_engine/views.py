@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 from urllib.parse import urlparse
@@ -9,8 +10,9 @@ from rest_framework import permissions, serializers, status, views
 from rest_framework.generics import GenericAPIView
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
-from rest_framework.throttling import UserRateThrottle
+from rest_framework.throttling import SimpleRateThrottle, UserRateThrottle
 
+from authentication.throttles import get_client_ip
 from authentication.token_permissions import ApiTokenScopePermission, get_api_token
 from drive.models import FileItem, StorageSettings, UserStorageAccount
 from storage_engine import accounts, alerts, credentials, health, login
@@ -204,6 +206,28 @@ class LoginStartThrottle(UserRateThrottle):
     scope = 'storage_login'
 
 
+class LoginStartIpThrottle(SimpleRateThrottle):
+    """Code requests per client IP: open sign-up must not turn the shared API ID into an SMS cannon."""
+    scope = 'storage_login_ip'
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {'scope': self.scope, 'ident': get_client_ip(request)}
+
+
+class LoginStartPhoneThrottle(SimpleRateThrottle):
+    """Code requests per phone number; the cache key holds a sha256 of the number, never the number."""
+    scope = 'storage_login_phone'
+
+    def get_cache_key(self, request, view):
+        phone = re.sub(r'[\s\-()]', '', str(request.data.get('phone', '')))
+        if not PHONE_RE.match(phone):
+            return None  # the serializer rejects it; nothing is sent to Telegram
+        return self.cache_format % {'scope': self.scope, 'ident': hashlib.sha256(phone.encode()).hexdigest()}
+
+
+LOGIN_START_THROTTLES = [LoginStartThrottle, LoginStartIpThrottle, LoginStartPhoneThrottle]
+
+
 class LoginStartSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=32)
 
@@ -230,7 +254,7 @@ def _login_error(exc):
 
 
 class StorageLoginStartView(StorageAdminView):
-    throttle_classes = [LoginStartThrottle]
+    throttle_classes = LOGIN_START_THROTTLES
 
     def post(self, request):
         serializer = LoginStartSerializer(data=request.data)
@@ -355,7 +379,7 @@ def _my_account(request) -> UserStorageAccount:
 
 
 class UserStorageLoginStartView(UserStorageView):
-    throttle_classes = [LoginStartThrottle]
+    throttle_classes = LOGIN_START_THROTTLES
 
     def post(self, request):
         serializer = LoginStartSerializer(data=request.data)
@@ -468,25 +492,18 @@ class AdminUsersView(GenericAPIView):
         return self.get_paginated_response(results)
 
 
+class AdminUserUpdateSerializer(serializers.Serializer):
+    system_storage_allowed = serializers.BooleanField(required=False)
+    is_active = serializers.BooleanField(required=False)
+    storage_quota = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+
+
 class AdminUserDetailView(StorageAdminView):
     def patch(self, request, pk):
         target = get_object_or_404(User, pk=pk)
-        fields = {}
-        for field in ('system_storage_allowed', 'is_active'):
-            if field in request.data:
-                fields[field] = bool(request.data[field])
-        if 'storage_quota' in request.data:
-            raw = request.data['storage_quota']
-            if raw is None:
-                fields['storage_quota'] = None
-            else:
-                try:
-                    quota = int(raw)
-                except (TypeError, ValueError):
-                    raise serializers.ValidationError({"storage_quota": "Must be null or an integer >= 0."})
-                if quota < 0:
-                    raise serializers.ValidationError({"storage_quota": "Must be null or an integer >= 0."})
-                fields['storage_quota'] = quota
+        serializer = AdminUserUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        fields = dict(serializer.validated_data)
 
         if fields.get('is_active') is False and target.pk == request.user.pk:
             return Response({'error': 'Cannot deactivate yourself.'}, status=status.HTTP_400_BAD_REQUEST)

@@ -141,6 +141,8 @@ REST_FRAMEWORK = {
         'auth': '10/min',
         'login': '5/min',
         'storage_login': '5/hour',
+        'storage_login_ip': '10/hour',
+        'storage_login_phone': '3/hour',
     },
     'EXCEPTION_HANDLER': 'storage_engine.exception_handler.storage_exception_handler',
 }

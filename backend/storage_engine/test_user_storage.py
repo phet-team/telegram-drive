@@ -829,9 +829,10 @@ class UserWizardTests(UserStorageTestCase):
         self.assertEqual(res.json()['storage_reason'], 'channel_unreachable')
 
     def test_start_is_throttled_to_five_per_hour(self):
-        for _ in range(5):
-            self.assertEqual(self.start().status_code, 200)
-        self.assertEqual(self.start().status_code, 429)
+        # distinct numbers: this checks the per-user limit, not the per-phone one
+        for i in range(5):
+            self.assertEqual(self.start(phone=f'+6681234560{i}').status_code, 200)
+        self.assertEqual(self.start(phone='+66812345609').status_code, 429)
 
     def test_secrets_never_in_responses_or_logs(self):
         with self.assertLogs(level=logging.DEBUG) as logs:

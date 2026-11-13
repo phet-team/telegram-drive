@@ -49,7 +49,8 @@ def run_selftest(size_mb: int, account=None) -> dict:
         result.update(failed_step=step, reason=exc.reason)
     except Exception as exc:
         logger.warning("Storage self-test failed at step=%s", step, exc_info=True)
-        result.update(failed_step=step, reason=f"{type(exc).__name__}: {exc}")
+        # Class name only: the message of an unclassified Telethon error can carry peer ids / access hashes.
+        result.update(failed_step=step, reason=type(exc).__name__)
     finally:
         if message_id is not None:  # a later step failed: do not leave the test message behind
             try:

@@ -135,6 +135,14 @@ def _classify(exc: BaseException):
 
 _chunk_lru_cache = {}
 _chunk_lru_lock = threading.Lock()
+
+
+def purge_chunk_cache(engine_key):
+    """Drops every cached chunk of one engine ('system' or 'user:<id>')."""
+    prefix = f"{engine_key}:"
+    with _chunk_lru_lock:
+        for k in [k for k in _chunk_lru_cache if k.startswith(prefix)]:
+            del _chunk_lru_cache[k]
 MAX_CACHED_CHUNKS = 6  # 6 chunks * 20MB = 120MB maximum RAM buffer
 
 
