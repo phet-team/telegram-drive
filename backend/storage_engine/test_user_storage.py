@@ -582,6 +582,25 @@ class HealthPerKeyTests(UserStorageTestCase):
         # the failure must not write status back onto the system row's alert state
         self.assertEqual(StorageSettings.objects.get(pk=1).alert_state, 'ok')
 
+    def test_folder_delete_prechecks_health_for_all_storages_before_deleting_chunks(self):
+        user = User.objects.create_user(email='folderhealth@example.com', system_storage_allowed=True)
+        account = self.link_account(user, session='USER-HEALTH')
+        folder = Folder.objects.create(name='mixed-folder', owner=user)
+        sys_file = FileItem.objects.create(name='sys.bin', owner=user, size=10, folder=folder, storage_account=None)
+        FileChunk.objects.create(file_item=sys_file, chunk_index=0, telegram_message_id=101,
+                                 telegram_file_id='101', chunk_size=10)
+        user_file = FileItem.objects.create(name='user.bin', owner=user, size=20, folder=folder, storage_account=account)
+        FileChunk.objects.create(file_item=user_file, chunk_index=0, telegram_message_id=102,
+                                 telegram_file_id='102', chunk_size=20)
+
+        health.record_failure('channel_unreachable', key=f'user:{account.id}')
+
+        res = self.api(user).delete(f'/api/drive/folders/{folder.id}/')
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(self.telegram.deleted, [])
+        self.assertTrue(FileItem.objects.filter(pk=sys_file.pk).exists())
+        self.assertTrue(FileItem.objects.filter(pk=user_file.pk).exists())
+
 
 # --------------------------------------------------------------------- test 8: user wizard
 

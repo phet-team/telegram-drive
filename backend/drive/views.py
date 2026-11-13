@@ -195,6 +195,13 @@ class FolderViewSet(viewsets.ModelViewSet):
         by_account = {}
         for f in user_files:
             by_account.setdefault(f.storage_account, []).append(f)
+
+        # Pre-check health for every connected storage before deleting any message.
+        for storage_account in by_account:
+            if storage_account is not None and not storage_account.has_session:
+                continue
+            health.raise_if_known_down(key='system' if storage_account is None else f"user:{storage_account.id}")
+
         for storage_account, group_files in by_account.items():
             if storage_account is not None and not storage_account.has_session:
                 logger.warning(
@@ -202,7 +209,6 @@ class FolderViewSet(viewsets.ModelViewSet):
                     storage_account.id,
                 )
                 continue
-            health.raise_if_known_down(key='system' if storage_account is None else f"user:{storage_account.id}")
             engine = engine_for(storage_account)
             for f in group_files:
                 for c in f.chunks.all():
