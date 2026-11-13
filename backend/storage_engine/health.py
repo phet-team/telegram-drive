@@ -71,7 +71,7 @@ def _db_write(account_id, status, reason):
     from drive.models import UserStorageAccount
 
     try:
-        UserStorageAccount.objects.filter(pk=account_id).update(
+        UserStorageAccount.objects.filter(pk=account_id).exclude(status='disconnected').update(
             status=status, last_check_at=timezone.now(), last_check_reason=reason)
     except Exception:  # never let a status mirror hide the original storage error
         logger.warning("Could not write storage status for account %s", account_id, exc_info=True)

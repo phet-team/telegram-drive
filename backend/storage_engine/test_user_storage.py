@@ -337,6 +337,8 @@ class EngineRoutingTests(UserStorageTestCase):
         res = self.stream(self.client, item.id)
         self.assertEqual(res.status_code, 503)
         self.assertEqual(res.json()['reason'], 'storage_not_connected')
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.status, 'disconnected')
 
 
 # -------------------------------------------------------------------------- test 4: quota
