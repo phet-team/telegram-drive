@@ -4,6 +4,7 @@ import api from '../services/api';
 import { useFeedbackStore } from './feedback';
 import { useDriveStore } from './drive';
 import { useAuthStore } from './auth';
+import { useStorageStore } from './storage';
 
 const envChunkMb = Number(import.meta.env.VITE_CHUNK_SIZE_MB);
 const CHUNK_SIZE = (!isNaN(envChunkMb) && envChunkMb > 0 ? envChunkMb : 8) * 1024 * 1024;
@@ -271,7 +272,15 @@ export const useUploadStore = defineStore('upload', () => {
       }
       task.status = 'failed';
       task.speed = 'Failed';
-      const msg = err.response?.data?.[0] || err.response?.data?.detail || err.message || 'Upload failed';
+      const storageNotConnected =
+        err.response?.status === 409 && err.response?.data?.error === 'storage_not_connected';
+      if (storageNotConnected) {
+        // Resync so banners and upload affordances update right away.
+        useStorageStore().fetchMyStorage().catch(() => {});
+      }
+      const msg = storageNotConnected
+        ? 'Connect your Telegram account in Settings → My storage to upload.'
+        : (err.response?.data?.[0] || err.response?.data?.detail || err.message || 'Upload failed');
       task.error = msg;
       feedback.showToast('error', `${task.name}: ${msg}`);
     }

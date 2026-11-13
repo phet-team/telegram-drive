@@ -132,6 +132,14 @@
               <span>API tokens</span>
             </button>
             <button
+              type="button"
+              class="w-full py-2.5 px-4 text-[#1f1f1f] hover:bg-[#f0f4f9] rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
+              @click="handleMyStorage"
+            >
+              <Cloud class="w-4 h-4" />
+              <span>My storage</span>
+            </button>
+            <button
               v-if="auth.user?.is_superuser"
               type="button"
               class="w-full py-2.5 px-4 text-[#1f1f1f] hover:bg-[#f0f4f9] rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
@@ -139,6 +147,15 @@
             >
               <HardDrive class="w-4 h-4" />
               <span>Storage</span>
+            </button>
+            <button
+              v-if="auth.user?.is_superuser"
+              type="button"
+              class="w-full py-2.5 px-4 text-[#1f1f1f] hover:bg-[#f0f4f9] rounded-full flex items-center justify-center gap-2 font-medium text-sm transition-colors cursor-pointer"
+              @click="handleAdminUsers"
+            >
+              <Users class="w-4 h-4" />
+              <span>Users</span>
             </button>
             <button
               type="button"
@@ -157,7 +174,7 @@
 
 <script setup>
 import { ref, computed } from 'vue';
-import { Search, X, HelpCircle, LogOut, Menu, KeyRound, HardDrive } from 'lucide-vue-next';
+import { Search, X, HelpCircle, LogOut, Menu, KeyRound, HardDrive, Cloud, Users } from 'lucide-vue-next';
 import GoogleDriveLogo from '../common/GoogleDriveLogo.vue';
 import { useAuthStore } from '../../stores/auth';
 import { useDriveStore } from '../../stores/drive';
@@ -209,6 +226,16 @@ const handleApiTokens = () => {
 const handleStorageSettings = () => {
   isDropdownOpen.value = false;
   router.push('/settings/storage');
+};
+
+const handleMyStorage = () => {
+  isDropdownOpen.value = false;
+  router.push('/settings/my-storage');
+};
+
+const handleAdminUsers = () => {
+  isDropdownOpen.value = false;
+  router.push('/settings/users');
 };
 
 const handleLogout = () => {

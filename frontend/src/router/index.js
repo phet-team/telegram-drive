@@ -15,6 +15,18 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    path: '/settings/my-storage',
+    name: 'MyStorage',
+    component: () => import('../views/MyStorageView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/settings/users',
+    name: 'AdminUsers',
+    component: () => import('../views/AdminUsersView.vue'),
+    meta: { requiresAuth: true, requiresSuperuser: true },
+  },
+  {
     path: '/settings/tokens',
     name: 'ApiTokens',
     component: ApiTokensView,

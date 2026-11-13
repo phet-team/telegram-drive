@@ -22,9 +22,11 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { UploadCloud } from 'lucide-vue-next';
 import { useUploadStore } from '../../stores/upload';
 import { useDriveStore } from '../../stores/drive';
+import { useStorageStore } from '../../stores/storage';
 
 const uploadStore = useUploadStore();
 const drive = useDriveStore();
+const storageStore = useStorageStore();
 const isDragging = ref(false);
 let dragCounter = 0;
 
@@ -33,6 +35,7 @@ const folderTitle = computed(() => {
 });
 
 const canUploadHere = computed(() => {
+  if (!storageStore.canUpload) return false;
   if (drive.currentSection === 'trash') return false;
   if (drive.currentSection === 'starred') {
     return !!drive.currentFolder && (drive.currentFolder.effective_role === 'editor' || drive.currentFolder.effective_role === 'owner');

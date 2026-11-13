@@ -104,6 +104,28 @@
           </div>
 
           <template v-else>
+            <div
+              v-if="!storageStore.canUpload"
+              class="mb-6 bg-[#f8fafd] border border-gray-200 rounded-2xl p-5 sm:p-6 flex flex-col sm:flex-row items-start sm:items-center gap-4"
+            >
+              <div class="w-10 h-10 rounded-full bg-[#d3e3fd]/60 text-[#0b57d0] flex items-center justify-center shrink-0">
+                <CloudUpload class="w-5 h-5" />
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-medium text-[#1f1f1f]">Connect your Telegram to start uploading</div>
+                <div class="text-xs text-[#747775] mt-0.5">
+                  Your files live in your own Telegram account. Connect it to upload new files.
+                </div>
+              </div>
+              <button
+                type="button"
+                class="px-5 py-2.5 rounded-full bg-[#0b57d0] hover:bg-[#0842a0] text-white text-sm font-medium shadow-xs transition-all cursor-pointer shrink-0"
+                @click="$router.push('/settings/my-storage')"
+              >
+                Connect Telegram
+              </button>
+            </div>
+
             <FileGrid
               v-if="drive.viewMode === 'grid'"
               @open-folder="handleOpenFolder"
@@ -170,11 +192,12 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
-import { List, LayoutGrid } from 'lucide-vue-next';
+import { List, LayoutGrid, CloudUpload } from 'lucide-vue-next';
 import api from '../services/api';
 import { useDriveStore } from '../stores/drive';
 import { useFeedbackStore } from '../stores/feedback';
 import { useHistoryStore } from '../stores/history';
+import { useStorageStore } from '../stores/storage';
 import Navbar from '../components/layout/Navbar.vue';
 import StorageAlertBanner from '../components/feedback/StorageAlertBanner.vue';
 import Sidebar from '../components/layout/Sidebar.vue';
@@ -199,6 +222,7 @@ import { useMarqueeSelection } from '../composables/useMarqueeSelection';
 const drive = useDriveStore();
 const feedback = useFeedbackStore();
 const history = useHistoryStore();
+const storageStore = useStorageStore();
 
 const scrollContainerRef = ref(null);
 const { isDragging, selectionBox } = useMarqueeSelection(scrollContainerRef);

@@ -36,6 +36,7 @@
         <button
           type="button"
           :disabled="!canCreateNew"
+          :title="!storageStore.canUpload ? 'Connect your Telegram account in Settings → My storage to upload' : ''"
           :class="[
             'flex items-center gap-3.5 px-5 py-3 rounded-2xl transition-all font-medium text-sm',
             canCreateNew
@@ -196,6 +197,7 @@ import GoogleDriveLogo from '../common/GoogleDriveLogo.vue';
 import { useDriveStore } from '../../stores/drive';
 import { useUploadStore } from '../../stores/upload';
 import { useAuthStore } from '../../stores/auth';
+import { useStorageStore } from '../../stores/storage';
 
 const props = defineProps({
   isOpen: Boolean,
@@ -206,6 +208,7 @@ const emit = defineEmits(['openCreateFolder', 'close']);
 const drive = useDriveStore();
 const uploadStore = useUploadStore();
 const auth = useAuthStore();
+const storageStore = useStorageStore();
 
 const isNewMenuOpen = ref(false);
 const fileInputRef = ref(null);
@@ -216,6 +219,7 @@ const quotaPercent = computed(() => {
 });
 
 const canCreateNew = computed(() => {
+  if (!storageStore.canUpload) return false;
   if (drive.currentSection === 'trash') return false;
   if (drive.currentSection === 'starred') {
     return !!drive.currentFolder && (drive.currentFolder.effective_role === 'editor' || drive.currentFolder.effective_role === 'owner');

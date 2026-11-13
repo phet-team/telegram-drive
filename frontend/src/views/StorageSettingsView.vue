@@ -90,89 +90,7 @@
             Signs the server in to Telegram again. The new session is stored encrypted in the database.
           </p>
 
-          <!-- Step 1: phone -->
-          <form v-if="wizard.step === 'phone'" class="flex flex-col gap-3" @submit.prevent="handleLoginStart">
-            <label class="block text-xs text-[#444746]" for="wizard-phone">Phone number (international format)</label>
-            <input
-              id="wizard-phone"
-              v-model="wizard.phone"
-              type="tel"
-              autocomplete="off"
-              placeholder="+66812345678"
-              :class="inputCls"
-            />
-            <div class="flex justify-end">
-              <button type="submit" :disabled="!wizard.phone.trim() || wizard.busy" :class="primaryBtn(!!wizard.phone.trim() && !wizard.busy)">
-                {{ wizard.busy ? 'Sending...' : 'Send code' }}
-              </button>
-            </div>
-          </form>
-
-          <!-- Step 2: code -->
-          <form v-else-if="wizard.step === 'code'" class="flex flex-col gap-3" @submit.prevent="handleLoginVerify">
-            <label class="block text-xs text-[#444746]" for="wizard-code">
-              Login code sent to Telegram on your phone
-              <span class="text-[#747775]">(expires in {{ countdownText }})</span>
-            </label>
-            <input
-              id="wizard-code"
-              v-model="wizard.code"
-              type="password"
-              inputmode="numeric"
-              autocomplete="off"
-              placeholder="12345"
-              :class="inputCls"
-            />
-            <div class="flex justify-between gap-2">
-              <button type="button" class="px-4 py-2 rounded-full text-sm font-medium text-[#444746] hover:bg-black/5 cursor-pointer" @click="handleLoginCancel">
-                Cancel
-              </button>
-              <button type="submit" :disabled="!wizard.code.trim() || wizard.busy" :class="primaryBtn(!!wizard.code.trim() && !wizard.busy)">
-                {{ wizard.busy ? 'Checking...' : 'Verify code' }}
-              </button>
-            </div>
-          </form>
-
-          <!-- Step 3: 2-step password -->
-          <form v-else-if="wizard.step === 'password'" class="flex flex-col gap-3" @submit.prevent="handleLoginPassword">
-            <label class="block text-xs text-[#444746]" for="wizard-password">
-              This account has 2-step verification. Enter its password
-              <span class="text-[#747775]">(expires in {{ countdownText }})</span>
-            </label>
-            <input
-              id="wizard-password"
-              v-model="wizard.password"
-              type="password"
-              autocomplete="off"
-              :class="inputCls"
-            />
-            <div class="flex justify-between gap-2">
-              <button type="button" class="px-4 py-2 rounded-full text-sm font-medium text-[#444746] hover:bg-black/5 cursor-pointer" @click="handleLoginCancel">
-                Cancel
-              </button>
-              <button type="submit" :disabled="!wizard.password || wizard.busy" :class="primaryBtn(!!wizard.password && !wizard.busy)">
-                {{ wizard.busy ? 'Checking...' : 'Sign in' }}
-              </button>
-            </div>
-          </form>
-
-          <!-- Done -->
-          <div v-else class="flex flex-col gap-3">
-            <div class="flex items-center gap-2 text-[#137333]">
-              <CheckCircle class="w-5 h-5" />
-              <span class="text-sm font-medium">Connected as {{ wizard.account || 'your Telegram account' }}.</span>
-            </div>
-            <p v-if="wizard.storageOk" class="text-sm text-[#137333]">Storage check passed (a test message was sent and removed).</p>
-            <p v-else class="text-sm text-[#c5221f]">
-              Signed in, but the storage check failed at "{{ wizard.storageStep }}": {{ reasonLabel(wizard.storageReason) }}.
-              Check the chat id under Advanced.
-            </p>
-            <div class="flex justify-end">
-              <button type="button" :class="secondaryBtn" @click="resetWizard">Done</button>
-            </div>
-          </div>
-
-          <p v-if="wizard.error" class="mt-3 text-sm text-[#c5221f]">{{ wizard.error }}</p>
+          <TelegramLoginWizard ref="wizardRef" :api-base-path="'/admin/storage'" @connected="handleConnected" />
         </section>
 
         <!-- Alerts -->
@@ -281,12 +199,13 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
-import { ArrowLeft, HardDrive, CheckCircle, ChevronDown } from 'lucide-vue-next';
+import { ref, reactive, nextTick, onMounted } from 'vue';
+import { ArrowLeft, HardDrive, ChevronDown } from 'lucide-vue-next';
 import {
   getStorageSettings, updateStorageSettings, testStorage, sendTestAlert, runSelftest,
-  loginStart, loginVerify, loginPassword, loginCancel, reasonLabel, errorText,
+  reasonLabel, errorText,
 } from '../services/storage';
+import TelegramLoginWizard from '../components/storage/TelegramLoginWizard.vue';
 
 const inputCls = 'w-full h-10 px-3.5 rounded-lg bg-[#f8fafd] border border-gray-200 focus:bg-white focus:border-[#0b57d0] focus:outline-none text-sm';
 const secondaryBtn = 'px-4 py-2 rounded-full text-sm font-medium text-[#0b57d0] bg-[#f0f4f9] hover:bg-[#e1e9f7] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer';
@@ -314,19 +233,7 @@ const advanced = reactive({ chatId: '', sessionString: '' });
 const advancedError = ref('');
 const advancedSaved = ref(false);
 
-const wizard = reactive({
-  step: 'phone', phone: '', code: '', password: '', busy: false, error: '',
-  account: '', storageOk: true, storageStep: '', storageReason: '',
-});
-const secondsLeft = ref(0);
-let expiresAt = 0;
-let countdownTimer = null;
-
-const countdownText = computed(() => {
-  const m = Math.floor(secondsLeft.value / 60);
-  const s = String(secondsLeft.value % 60).padStart(2, '0');
-  return `${m}:${s}`;
-});
+const wizardRef = ref(null);
 
 const formatDate = (value) => new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
@@ -344,53 +251,8 @@ const refresh = async () => {
   return data;
 };
 
-// -- wizard countdown ------------------------------------------------------------------------
-const stopCountdown = () => {
-  if (countdownTimer) clearInterval(countdownTimer);
-  countdownTimer = null;
-};
-
-const startCountdown = (seconds) => {
-  stopCountdown();
-  expiresAt = Date.now() + seconds * 1000;
-  secondsLeft.value = seconds;
-  countdownTimer = setInterval(() => {
-    secondsLeft.value = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
-    if (secondsLeft.value === 0) {
-      stopCountdown();
-      wizard.step = 'phone';
-      wizard.code = '';
-      wizard.password = '';
-      wizard.error = 'The login code expired. Send a new code.';
-    }
-  }, 1000);
-};
-
-const resetWizard = () => {
-  stopCountdown();
-  Object.assign(wizard, { step: 'phone', phone: '', code: '', password: '', busy: false, error: '' });
-};
-
-const handleLoginStart = async () => {
-  wizard.busy = true;
-  wizard.error = '';
-  try {
-    const { data } = await loginStart(wizard.phone.trim());
-    wizard.step = 'code';
-    startCountdown(data.expires_in);
-  } catch (err) {
-    wizard.error = errorText(err, 'Could not send the code');
-  } finally {
-    wizard.busy = false;
-  }
-};
-
-const finishLogin = async (data) => {
-  stopCountdown();
-  Object.assign(wizard, {
-    step: 'done', code: '', password: '', account: data.account,
-    storageOk: data.storage_ok, storageStep: data.storage_step || '', storageReason: data.storage_reason || '',
-  });
+// -- wizard / status actions -------------------------------------------------------------------
+const handleConnected = async () => {
   try {
     await refresh();
   } catch (err) {
@@ -398,48 +260,6 @@ const finishLogin = async (data) => {
   }
 };
 
-const handleLoginVerify = async () => {
-  wizard.busy = true;
-  wizard.error = '';
-  try {
-    const { data } = await loginVerify(wizard.code.trim());
-    if (data.needs_password) {
-      wizard.step = 'password';
-      wizard.code = '';
-    } else {
-      await finishLogin(data);
-    }
-  } catch (err) {
-    wizard.error = errorText(err, 'Could not verify the code');
-  } finally {
-    wizard.busy = false;
-  }
-};
-
-const handleLoginPassword = async () => {
-  wizard.busy = true;
-  wizard.error = '';
-  try {
-    const { data } = await loginPassword(wizard.password);
-    await finishLogin(data);
-  } catch (err) {
-    wizard.error = errorText(err, 'Could not sign in');
-  } finally {
-    wizard.busy = false;
-  }
-};
-
-const handleLoginCancel = async () => {
-  try {
-    await loginCancel();
-  } catch (err) {
-    wizard.error = errorText(err, 'Could not cancel the login');
-    return;
-  }
-  resetWizard();
-};
-
-// -- status actions --------------------------------------------------------------------------
 const handleTest = async () => {
   busy.test = true;
   statusError.value = '';
@@ -535,18 +355,18 @@ const handleSaveAdvanced = async () => {
 };
 
 onMounted(async () => {
+  let data = null;
   try {
-    const data = await refresh();
-    if (data.login_pending) {
-      wizard.step = 'code';
-      startCountdown(data.login_seconds_left);
-    }
+    data = await refresh();
   } catch (err) {
     loadError.value = errorText(err, 'Failed to load storage settings');
   } finally {
     isLoading.value = false;
   }
+  if (data && data.login_pending) {
+    // The wizard only mounts once loading is off — let the DOM catch up.
+    await nextTick();
+    wizardRef.value?.resume(data.login_seconds_left);
+  }
 });
-
-onUnmounted(stopCountdown);
 </script>

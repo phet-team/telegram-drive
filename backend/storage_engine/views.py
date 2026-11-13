@@ -308,6 +308,7 @@ def serialize_user_storage_me(user):
             'reason': account.last_check_reason if account else '',
             'account_name': account.tg_display_name if account else '',
             'connected_at': account.connected_at if account else None,
+            'last_check_at': account.last_check_at if account else None,
             'file_count': file_count,
             'bytes': bytes_used,
         },

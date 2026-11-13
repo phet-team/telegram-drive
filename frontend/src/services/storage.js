@@ -10,13 +10,17 @@ export const sendTestAlert = () => api.post('/admin/storage/test-alert/');
 
 export const runSelftest = (sizeMb) => api.post('/admin/storage/selftest/', { size_mb: sizeMb });
 
-export const loginStart = (phone) => api.post('/admin/storage/login/start/', { phone });
+export const getMyStorage = () => api.get('/storage/me/');
 
-export const loginVerify = (code) => api.post('/admin/storage/login/verify/', { code });
+export const updateMyStorage = (payload) => api.put('/storage/me/', payload);
 
-export const loginPassword = (password) => api.post('/admin/storage/login/password/', { password });
+export const testMyStorage = () => api.post('/storage/me/test/');
 
-export const loginCancel = () => api.post('/admin/storage/login/cancel/');
+export const disconnectMyStorage = () => api.post('/storage/me/disconnect/');
+
+export const getAdminUsers = (params) => api.get('/admin/users/', { params });
+
+export const updateAdminUser = (id, payload) => api.patch(`/admin/users/${id}/`, payload);
 
 export const REASON_LABELS = {
   telegram_session_expired: 'The Telegram session expired or was revoked',
@@ -25,6 +29,7 @@ export const REASON_LABELS = {
   telegram_unreachable: 'Telegram cannot be reached from the server',
   credentials_unreadable: 'Stored credentials cannot be decrypted',
   telegram_not_configured: 'Telegram API credentials are missing on the server',
+  storage_not_connected: 'The storage account is not connected',
   unexpected_error: 'Unexpected storage error',
 };
 
