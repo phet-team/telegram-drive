@@ -22,6 +22,11 @@ def weight_to_role(weight: int) -> Optional[str]:
     return None
 
 
+def _on_foreign_own_storage(user, item) -> bool:
+    """A file stored in another user's own Telegram account: the superuser override never reaches it."""
+    return isinstance(item, FileItem) and item.storage_account_id is not None and item.owner_id != user.id
+
+
 def resolve_effective_role(user, item) -> Optional[str]:
     """
     Computes effective permission for a user on a Folder or FileItem.
@@ -33,7 +38,7 @@ def resolve_effective_role(user, item) -> Optional[str]:
     if not user or not getattr(user, 'is_authenticated', False):
         return None
 
-    if user.is_superuser:
+    if user.is_superuser and not _on_foreign_own_storage(user, item):
         return 'owner'
 
     # 1. Direct owner check
@@ -84,7 +89,7 @@ def can_write(user, item) -> bool:
 
 def can_delete_forever(user, item) -> bool:
     """Only true Owner can delete permanently"""
-    return item.owner_id == user.id or user.is_superuser
+    return item.owner_id == user.id or (user.is_superuser and not _on_foreign_own_storage(user, item))
 
 
 def can_share(user, item) -> bool:
