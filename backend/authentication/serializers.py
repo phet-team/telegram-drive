@@ -17,9 +17,11 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'email', 'name', 'avatar_url',
             'storage_used', 'storage_reserved', 'storage_quota',
-            'available_quota', 'telegram_id', 'google_sub', 'date_joined', 'is_superuser'
+            'available_quota', 'telegram_id', 'google_sub', 'date_joined', 'is_superuser',
+            'system_storage_allowed', 'upload_target',
         ]
-        read_only_fields = ['id', 'is_superuser', 'storage_used', 'storage_reserved', 'storage_quota', 'date_joined']
+        read_only_fields = ['id', 'is_superuser', 'storage_used', 'storage_reserved', 'storage_quota',
+                            'date_joined', 'system_storage_allowed', 'upload_target']
 
 
 class RegisterSerializer(serializers.Serializer):

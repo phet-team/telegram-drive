@@ -40,6 +40,14 @@ class User(AbstractBaseUser, PermissionsMixin):
     storage_reserved = models.BigIntegerField(default=0, help_text="Bytes currently reserved by ongoing uploads")
     storage_quota = models.BigIntegerField(null=True, blank=True, default=None, help_text="Null means unlimited Telegram storage")
     
+    system_storage_allowed = models.BooleanField(default=False, help_text="May read/write the shared system Telegram storage")
+    upload_target = models.CharField(
+        max_length=8,
+        choices=[('own', 'own'), ('system', 'system')],
+        default='own',
+        help_text="Where uploads go: 'own' = the user's connected account, 'system' = the shared system storage",
+    )
+
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(default=timezone.now)
@@ -51,6 +59,10 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.email
+
+    @property
+    def can_use_system_storage(self) -> bool:
+        return self.is_superuser or self.system_storage_allowed
 
     @property
     def available_quota(self) -> int:

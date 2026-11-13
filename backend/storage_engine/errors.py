@@ -14,6 +14,7 @@ REASON_MESSAGES = {
     'telegram_unreachable': 'Telegram cannot be reached from the server.',
     'credentials_unreadable': 'Stored Telegram credentials cannot be decrypted (DJANGO_SECRET_KEY changed?); reconnect Telegram.',
     'telegram_not_configured': 'TELEGRAM_API_ID / TELEGRAM_API_HASH are not configured on the server.',
+    'storage_not_connected': 'The storage account is not connected.',
 }
 
 
@@ -25,3 +26,11 @@ class StorageUnavailable(Exception):
         self.retry_after = int(retry_after)
         self.message = message or REASON_MESSAGES.get(reason, 'Storage is temporarily unavailable.')
         super().__init__(f"{reason}: {self.message}")
+
+
+class StorageNotConnected(Exception):
+    """The user has not connected a storage account. Surfaces as HTTP 409."""
+
+    def __init__(self, message=None):
+        self.message = message or "Connect your Telegram account in Settings → My storage to upload."
+        super().__init__(self.message)

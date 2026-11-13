@@ -1,7 +1,7 @@
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 
-from storage_engine.errors import ContentUnavailable, StorageUnavailable
+from storage_engine.errors import ContentUnavailable, StorageNotConnected, StorageUnavailable
 
 
 def storage_exception_handler(exc, context):
@@ -15,4 +15,6 @@ def storage_exception_handler(exc, context):
         return response
     if isinstance(exc, ContentUnavailable):
         return Response({'error': 'content_unavailable'}, status=410)
+    if isinstance(exc, StorageNotConnected):
+        return Response({'error': 'storage_not_connected', 'message': exc.message}, status=409)
     return drf_exception_handler(exc, context)

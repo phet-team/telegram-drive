@@ -40,6 +40,11 @@ class FileItem(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    storage_account = models.ForeignKey(
+        'UserStorageAccount', null=True, blank=True,
+        on_delete=models.PROTECT, related_name='files', db_index=True,
+    )
+
     class Meta:
         ordering = ['-created_at']
 
@@ -86,6 +91,10 @@ class UploadSession(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     expires_at = models.DateTimeField()
+    storage_account = models.ForeignKey(
+        'UserStorageAccount', null=True, blank=True,
+        on_delete=models.CASCADE, related_name='upload_sessions',
+    )
 
     def is_expired(self):
         return timezone.now() > self.expires_at
@@ -191,7 +200,36 @@ class ShareLink(models.Model):
         ]
 
 
-class StorageSettings(models.Model):
+class PendingLoginMixin(models.Model):
+    """State of an in-progress "Reconnect Telegram" login. Secrets are Fernet-encrypted.
+
+    Shared by the system singleton (StorageSettings) and per-user accounts
+    (UserStorageAccount).
+    """
+
+    pending_login_session_enc = models.TextField(blank=True, default='')
+    pending_phone = models.CharField(max_length=32, blank=True, default='')
+    pending_code_hash = models.TextField(blank=True, default='')
+    pending_expires_at = models.DateTimeField(null=True, blank=True)
+
+    PENDING_FIELDS = ['pending_login_session_enc', 'pending_phone', 'pending_code_hash', 'pending_expires_at']
+
+    class Meta:
+        abstract = True
+
+    def login_seconds_left(self) -> int:
+        if not self.pending_login_session_enc or not self.pending_expires_at:
+            return 0
+        return max(0, int((self.pending_expires_at - timezone.now()).total_seconds()))
+
+    def clear_pending_login(self):
+        self.pending_login_session_enc = ''
+        self.pending_phone = ''
+        self.pending_code_hash = ''
+        self.pending_expires_at = None
+
+
+class StorageSettings(PendingLoginMixin, models.Model):
     """
     Singleton (pk=1) holding Telegram storage credentials, alert settings and the
     state of an in-progress "Reconnect Telegram" login. Secrets are Fernet-encrypted.
@@ -223,11 +261,6 @@ class StorageSettings(models.Model):
     last_check_ok = models.BooleanField(null=True, blank=True)
     last_check_reason = models.CharField(max_length=64, blank=True, default='')
 
-    pending_login_session_enc = models.TextField(blank=True, default='')
-    pending_phone = models.CharField(max_length=32, blank=True, default='')
-    pending_code_hash = models.TextField(blank=True, default='')
-    pending_expires_at = models.DateTimeField(null=True, blank=True)
-
     updated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+'
     )
@@ -245,15 +278,33 @@ class StorageSettings(models.Model):
     def has_session(self) -> bool:
         return bool(self.session_string_enc)
 
-    def login_seconds_left(self) -> int:
-        if not self.pending_login_session_enc or not self.pending_expires_at:
-            return 0
-        return max(0, int((self.pending_expires_at - timezone.now()).total_seconds()))
 
-    def clear_pending_login(self):
-        self.pending_login_session_enc = ''
-        self.pending_phone = ''
-        self.pending_code_hash = ''
-        self.pending_expires_at = None
+class UserStorageAccount(PendingLoginMixin, models.Model):
+    """A user's own connected Telegram account used for per-user storage."""
 
-    PENDING_FIELDS = ['pending_login_session_enc', 'pending_phone', 'pending_code_hash', 'pending_expires_at']
+    STATUS_CHOICES = [
+        ('disconnected', 'disconnected'),
+        ('ok', 'ok'),
+        ('down', 'down'),
+    ]
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='storage_account'
+    )
+    session_string_enc = models.TextField(blank=True, default='')
+    tg_user_id = models.BigIntegerField(null=True, blank=True, unique=True)
+    tg_display_name = models.CharField(max_length=255, blank=True, default='')
+    channel_id = models.BigIntegerField(null=True, blank=True)
+    channel_access_hash = models.BigIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=16, default='disconnected', choices=STATUS_CHOICES)
+    last_check_at = models.DateTimeField(null=True, blank=True)
+    last_check_reason = models.CharField(max_length=64, blank=True, default='')
+    connected_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def has_session(self) -> bool:
+        return bool(self.session_string_enc)
+
+    def __str__(self):
+        return f"UserStorageAccount({self.user_id}, {self.tg_display_name or self.status})"
