@@ -16,7 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class AppConfig(BaseSettings):
     # Core Django
     DJANGO_SECRET_KEY: str = "django-insecure-prod-key-must-be-long-and-secure-change-in-prod"
-    DEBUG: bool = True
+    DEBUG: bool = False
     ALLOWED_HOSTS: str = "localhost,127.0.0.1"
 
     # Database (PostgreSQL / Neon URL)
