@@ -9,15 +9,16 @@ from storage_engine.errors import StorageUnavailable
 logger = logging.getLogger(__name__)
 
 
-def run_selftest(size_mb: int) -> dict:
+def run_selftest(size_mb: int, account=None) -> dict:
     """
     Upload random bytes, download them, compare sha256, delete the message.
+    `account` (a UserStorageAccount or id) selects the per-user engine; None is system.
     Returns {"ok", "size_mb", "up_s", "down_s", "delete_s", "failed_step", "reason"};
     `failed_step` is the first failing step: upload | download | compare | delete.
     """
     result = {'ok': False, 'size_mb': size_mb, 'up_s': None, 'down_s': None, 'delete_s': None,
               'failed_step': None, 'reason': ''}
-    engine = get_storage_engine()
+    engine = get_storage_engine(account=account)
     payload = os.urandom(size_mb * 1024 * 1024)
     expected = hashlib.sha256(payload).hexdigest()
     message_id = None

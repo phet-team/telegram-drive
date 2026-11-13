@@ -149,9 +149,9 @@ class StorageTestCase(TestCase):
 
     @staticmethod
     def reset_state():
-        engine_client._engine_instances.clear()
+        engine_client._engine_pool.clear()
         engine_client._chunk_lru_cache.clear()
-        credentials.invalidate()
+        credentials.invalidate()  # system snapshot and every user snapshot
         health.reset()
 
     def use_db_session(self, session='SESSION-A', **fields):

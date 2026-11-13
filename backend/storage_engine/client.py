@@ -37,9 +37,17 @@ class BaseStorageEngine:
 
 class MockStorageEngine(BaseStorageEngine):
     """Local disk mock storage for development, testing, and CI"""
-    def __init__(self):
+    def __init__(self, key='mock'):
+        self.key = key
+        self.last_used_at = time.monotonic()
         self.storage_dir = settings.CHUNK_CACHE_DIR / "mock_store"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def health_check(self) -> None:
+        health.record_success(force=True, key=self.key)
+
+    def disconnect(self):
+        """Nothing persistent to close."""
 
     def upload_chunk(self, chunk_data: bytes, filename: str) -> Tuple[int, str]:
         chunk_hash = hashlib.sha256(chunk_data).hexdigest()
@@ -142,7 +150,10 @@ class TelegramMTProtoEngine(BaseStorageEngine):
     - Database access happens only on the calling (synchronous) thread; coroutines on the
       Telethon loop thread never touch the ORM.
     """
-    def __init__(self):
+    def __init__(self, key='system', creds_provider=None):
+        self.key = key
+        self._creds_provider = creds_provider or (lambda: credentials.get_snapshot())
+        self.last_used_at = time.monotonic()
         self._thread = get_telethon_thread()
         self._client = None
         self._version = None
@@ -152,7 +163,7 @@ class TelegramMTProtoEngine(BaseStorageEngine):
 
     @property
     def chat_id(self):
-        return credentials.get_snapshot().chat_id
+        return self._creds_provider().chat_id
 
     async def _ensure_client(self, creds):
         async with self._lock:
@@ -167,7 +178,11 @@ class TelegramMTProtoEngine(BaseStorageEngine):
             if self._client is None:
                 if not creds.api_id or not creds.api_hash:
                     raise StorageUnavailable('telegram_not_configured')
-                self._client = build_telegram_client(creds.session_str, creds.api_id, creds.api_hash)
+                # Only the system engine may fall back to the on-disk file session;
+                # per-user engines must have an explicit session string.
+                self._client = build_telegram_client(
+                    creds.session_str, creds.api_id, creds.api_hash,
+                    allow_file_session=(self.key == 'system'))
                 self._version = creds.version
                 await self._client.connect()
                 logger.info("Persistent Telegram MTProto client connected and warmed up.")
@@ -236,23 +251,26 @@ class TelegramMTProtoEngine(BaseStorageEngine):
 
     def _execute(self, label, op, which=None):
         """Synchronous entry point: resolves credentials, runs the call, records health/alerts."""
-        creds = credentials.get_snapshot()
+        self.last_used_at = time.monotonic()
+        creds = self._creds_provider()
         try:
             if creds.unreadable:
                 raise StorageUnavailable('credentials_unreadable')
+            if self.key != 'system' and not creds.session_str:
+                raise StorageUnavailable('storage_not_connected')
             result = self._thread.run_coro(self._call(creds, label, op, which))
         except StorageUnavailable as exc:
-            health.record_failure(exc.reason)
+            health.record_failure(exc.reason, key=self.key)
             raise
         except TimeoutError as exc:
-            health.record_failure('telegram_unreachable')
+            health.record_failure('telegram_unreachable', key=self.key)
             raise StorageUnavailable('telegram_unreachable') from exc
-        health.record_success()
+        health.record_success(key=self.key)
         return result
 
     def upload_chunk(self, chunk_data: bytes, filename: str) -> Tuple[int, str]:
         """Uploads chunk directly to Telegram MTProto over persistent warm connection"""
-        chat_id = credentials.get_snapshot().chat_id
+        chat_id = self.chat_id
 
         async def op(client):
             file_stream = io.BytesIO(chunk_data)
@@ -268,14 +286,14 @@ class TelegramMTProtoEngine(BaseStorageEngine):
     def download_chunk(self, file_id: str, message_id: int = None) -> bytes:
         """Downloads chunk directly from Telegram MTProto into memory buffer with LRU cache"""
         msg_id = int(message_id) if message_id else int(file_id)
-        cache_key = f"{file_id}_{msg_id}"
+        cache_key = f"{self.key}:{file_id}_{msg_id}"
         with _chunk_lru_lock:
             if cache_key in _chunk_lru_cache:
                 val = _chunk_lru_cache.pop(cache_key)
                 _chunk_lru_cache[cache_key] = val
                 return val
 
-        chat_id = credentials.get_snapshot().chat_id
+        chat_id = self.chat_id
 
         async def op(client):
             msg = await client.get_messages(chat_id, ids=msg_id)
@@ -301,11 +319,12 @@ class TelegramMTProtoEngine(BaseStorageEngine):
         unexpected failure (best effort); StorageUnavailable propagates so callers can report it.
         """
         with _chunk_lru_lock:
-            keys_to_delete = [k for k in _chunk_lru_cache if k.endswith(f"_{message_id}")]
+            keys_to_delete = [k for k in _chunk_lru_cache
+                              if k.startswith(f"{self.key}:") and k.endswith(f"_{message_id}")]
             for k in keys_to_delete:
                 del _chunk_lru_cache[k]
 
-        chat_id = credentials.get_snapshot().chat_id
+        chat_id = self.chat_id
 
         async def op(client):
             await client.delete_messages(chat_id, [message_id])
@@ -327,20 +346,80 @@ class TelegramMTProtoEngine(BaseStorageEngine):
 
         self._execute("health check", op)
 
+    def disconnect(self):
+        """Disconnect the persistent client on the Telethon loop thread."""
+        client = self._client
+        if client is None or not client.is_connected():
+            return
+        try:
+            self._thread.run_coro(client.disconnect())
+        except Exception:
+            logger.warning("Error disconnecting Telegram client for %s", self.key, exc_info=True)
 
-_engine_instances = {}
+
+_engine_pool = {}  # key -> engine; keys are 'system' or 'user:<account_id>'
 _engine_lock = threading.Lock()
+USER_ENGINE_IDLE_TTL = 900          # an idle per-user engine is disconnected after 15 min
+USER_ENGINE_MAX_PER_WORKER = 32     # cap of live user engines per process
 
 
-def get_storage_engine() -> BaseStorageEngine:
+def _evict_user_engines(now):
+    """Close engines idle for more than USER_ENGINE_IDLE_TTL, then trim to the per-worker cap."""
+    idle_keys = [k for k, eng in _engine_pool.items()
+                 if k != 'system' and now - getattr(eng, 'last_used_at', 0) > USER_ENGINE_IDLE_TTL]
+    for k in idle_keys:
+        eng = _engine_pool.pop(k)
+        try:
+            eng.disconnect()
+        except Exception:
+            pass
+    user_keys = [k for k in _engine_pool if k != 'system']
+    if len(user_keys) > USER_ENGINE_MAX_PER_WORKER:
+        user_keys.sort(key=lambda k: getattr(_engine_pool[k], 'last_used_at', 0))
+        for k in user_keys[: len(user_keys) - USER_ENGINE_MAX_PER_WORKER]:
+            eng = _engine_pool.pop(k)
+            try:
+                eng.disconnect()
+            except Exception:
+                pass
+
+
+def get_storage_engine(account=None) -> BaseStorageEngine:
     """
-    Telegram engine when the DB row holds a session or env STORAGE_BACKEND=mtproto
-    (unless the row's auth_mode is 'mock'); the local-disk mock engine otherwise.
+    One engine per key in a process-local pool: 'system' for the shared storage, 'user:<id>'
+    per connected account. The Telegram engine is used when the DB row holds a session or env
+    STORAGE_BACKEND=mtproto (unless auth_mode is 'mock'); the local-disk mock otherwise. User
+    engines follow the same choice as the system engine.
     """
+    if account is None:
+        key = 'system'
+    else:
+        account_id = account.id if hasattr(account, 'id') else int(account)
+        key = f"user:{account_id}"
+
     snap = credentials.get_snapshot()
     use_telegram = snap.mode != 'mock' and (config.STORAGE_BACKEND == "mtproto" or snap.source == 'db')
-    key = 'mtproto' if use_telegram else 'mock'
+
     with _engine_lock:
-        if key not in _engine_instances:
-            _engine_instances[key] = TelegramMTProtoEngine() if use_telegram else MockStorageEngine()
-        return _engine_instances[key]
+        _evict_user_engines(time.monotonic())
+        if key in _engine_pool:
+            existing = _engine_pool[key]
+            if isinstance(existing, TelegramMTProtoEngine) == use_telegram:
+                existing.last_used_at = time.monotonic()
+                return existing
+            # Class mismatch (mode switched between mock and mtproto), evict old.
+            _engine_pool.pop(key)
+            try:
+                existing.disconnect()
+            except Exception:
+                pass
+        if key == 'system':
+            engine = (TelegramMTProtoEngine(key='system', creds_provider=credentials.get_snapshot)
+                      if use_telegram else MockStorageEngine(key='system'))
+        else:
+            provider = lambda: credentials.get_account_snapshot(account_id)  # noqa: E731
+            engine = (TelegramMTProtoEngine(key=key, creds_provider=provider)
+                      if use_telegram else MockStorageEngine(key=key))
+        _engine_pool[key] = engine
+        _evict_user_engines(time.monotonic())  # run eviction so the pool never exceeds the user cap
+        return engine

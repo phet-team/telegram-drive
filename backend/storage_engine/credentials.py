@@ -31,6 +31,8 @@ class CredentialSnapshot:
 _lock = threading.Lock()
 _snapshot = None
 _checked_at = 0.0
+_user_snapshots = {}   # account_id -> CredentialSnapshot
+_user_checked_at = {}  # account_id -> monotonic time of the last re-check
 
 
 def parse_chat_id(value):
@@ -76,9 +78,56 @@ def get_snapshot(force: bool = False) -> CredentialSnapshot:
         return _snapshot
 
 
-def invalidate():
-    """Forget the cached snapshot so the next call re-reads the DB (used after local edits and in tests)."""
+def get_account_snapshot(account_id: int, force: bool = False) -> CredentialSnapshot:
+    """Same contract as get_snapshot() but for a user's own UserStorageAccount row."""
+    global _user_snapshots, _user_checked_at
+    from drive.models import UserStorageAccount
+
+    with _lock:
+        now = time.monotonic()
+        snapshot = _user_snapshots.get(account_id)
+        if not force and snapshot is not None and now - _user_checked_at.get(account_id, 0.0) < RELOAD_INTERVAL:
+            return snapshot
+        row = UserStorageAccount.objects.filter(pk=account_id).first()
+        current_version = row.updated_at.isoformat() if row is not None and row.updated_at else 'user-empty'
+        if force or snapshot is None or snapshot.version != current_version:
+            snapshot = _build_user(row)
+            _user_snapshots[account_id] = snapshot
+        _user_checked_at[account_id] = now
+        return snapshot
+
+
+def _build_user(row) -> CredentialSnapshot:
+    session_str, unreadable = '', False
+    if row is not None and row.session_string_enc:
+        try:
+            session_str = decrypt(row.session_string_enc)
+        except CredentialsUnreadable:
+            session_str, unreadable = '', True
+    chat_id = 'me'
+    if row is not None and row.channel_id and row.channel_access_hash:
+        from telethon.tl.types import InputPeerChannel
+
+        chat_id = InputPeerChannel(row.channel_id, row.channel_access_hash)
+    version = row.updated_at.isoformat() if row is not None and row.updated_at else 'user-empty'
+    return CredentialSnapshot(
+        source='db', mode='session', session_str=session_str, chat_id=chat_id, unreadable=unreadable,
+        api_id=config.TELEGRAM_API_ID, api_hash=config.TELEGRAM_API_HASH, version=version,
+    )
+
+
+def invalidate(account_id=None):
+    """
+    Forget cached snapshots so the next call re-reads the DB (used after edits and in tests).
+    Without an account_id: the system snapshot and every user snapshot. With one: just that account.
+    """
     global _snapshot, _checked_at
     with _lock:
-        _snapshot = None
-        _checked_at = 0.0
+        if account_id is None:
+            _snapshot = None
+            _checked_at = 0.0
+            _user_snapshots.clear()
+            _user_checked_at.clear()
+        else:
+            _user_snapshots.pop(account_id, None)
+            _user_checked_at.pop(account_id, None)
